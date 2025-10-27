@@ -1,0 +1,34 @@
+﻿# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Environment variables e credenziali (IMPORTANTE!)
+.env
+*.key
+*.pem
+secrets.json
+config.json
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Database locale
+*.db
+*.sqlite3
+
+# Backup
+*.bak
+*.backup
+
+# OS
+.DS_Store
+Thumbs.db
