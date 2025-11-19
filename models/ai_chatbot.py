@@ -71,15 +71,180 @@ def format_html_response(text):
 class DiscussChannel(models.Model):
     _inherit = 'discuss.channel'
     
+    # Questi metodi isolano logica specifica nel system prompt,
+    # migliorando manutenibilità, testabilità e riducendo costi API.
+    
     @api.model
-    def _get_gemini_response(self, config, messages):
-        """Chiama l'API di Gemini"""
+    def _normalize_product_search_term(self, search_term):
+        """
+        Task-specific prompt: normalizza termini di ricerca prodotti usando LLM.
+        
+        PROBLEMA: Odoo search è case-sensitive e non gestisce varianti (plurali, articoli, case).
+        SOLUZIONE: LLM normalizza il termine in un formato standard per massimizzare match.
+        
+        Esempio:
+        - "i Cestini Rossi" → "cestino rosso"
+        - "la Sedia ERGONOMICA" → "sedia ergonomica"
+        - "Prodotto casuale" → "prodotto casuale"
+        
+        Questo riduce ~200 token dal system prompt spostando la logica qui.
+        """
+        if not search_term or len(search_term.strip()) < 2:
+            return search_term
+        
+        original_term = search_term
+        
+        try:
+            config = self.env['ai.config'].get_active_config()
+            
+            # Task-specific prompt per normalizzazione
+            prompt = (
+                "Normalizza questo termine di ricerca prodotto per migliorare il match in database.\n\n"
+                "REGOLE:\n"
+                "1. Converti TUTTO in minuscolo\n"
+                "2. Rimuovi articoli (il, la, lo, un, una, i, gli, le)\n"
+                "3. Converti plurali in SINGOLARE (cestini→cestino, sedie→sedia)\n"
+                "4. Mantieni aggettivi e specifiche (rosso, ergonomico, ecc.)\n"
+                "5. NO spazi extra, NO punteggiatura\n\n"
+                "ESEMPI:\n"
+                "Input: 'i Cestini Rossi' → Output: 'cestino rosso'\n"
+                "Input: 'la SEDIA ergonomica' → Output: 'sedia ergonomica'\n"
+                "Input: 'Prodotto casuale' → Output: 'prodotto casuale'\n"
+                "Input: '5 armadi metallici' → Output: 'armadio metallico'\n\n"
+                f"Input: '{search_term}'\n"
+                "Output: "
+            )
+            
+            response = self._get_gemini_response(config, [{'role': 'user', 'content': prompt}])
+            normalized = response.strip().lower()
+            
+            # Pulizia finale
+            normalized = normalized.strip('"\'').strip()
+            
+            if normalized and normalized != original_term.lower():
+                _logger.info(f"✅ LLM normalizzazione: '{original_term}' → '{normalized}'")
+                return normalized
+            else:
+                _logger.info(f"ℹ️ Nessuna modifica necessaria: '{original_term}'")
+                return search_term
+        
+        except Exception as e:
+            _logger.error(f"Errore normalizzazione LLM: {e} - uso termine originale")
+            return search_term
+    
+    @api.model
+    def _classify_order_intent(self, user_message, last_bot_message_text=None):
+        """
+        Task-specific prompt: classifica se l'utente vuole CREARE o CONFERMARE un ordine.
+        
+        Questo alleggerisce il system prompt (~150 token) isolando la logica
+        di classificazione intent in una funzione testabile.
+        
+        Args:
+            user_message: Messaggio dell'utente
+            last_bot_message_text: Ultimo messaggio del bot (per cercare nome ordine)
+        
+        Returns:
+            tuple: (intent, order_name)
+                - intent: 'create' | 'confirm' | None
+                - order_name: Nome ordine estratto (solo per 'confirm')
+        """
+        text_lower = user_message.lower()
+        
+        # STEP 1: Pre-filter con parole chiave chiare
+        create_keywords = ['crea', 'nuovo', 'ordine per', 'fai un ordine', 'genera']
+        confirm_keywords = ['conferm', 'valid', 'approva', 'confermalo', 'validalo', 'ok vai']
+        
+        has_create = any(kw in text_lower for kw in create_keywords)
+        has_confirm = any(kw in text_lower for kw in confirm_keywords)
+        
+        # Caso chiaro: solo create
+        if has_create and not has_confirm:
+            _logger.info(f"Intent chiaro: CREATE (keyword: {[k for k in create_keywords if k in text_lower]})")
+            return ('create', None)
+        
+        # Caso chiaro: solo confirm
+        if has_confirm and not has_create:
+            order_name = None
+            
+            # Cerca SO123 o S00123 nel messaggio utente
+            match = re.search(r'\b(SO?\d+|S\d{5})\b', user_message, re.I)
+            if match:
+                order_name = match.group(1).upper()
+            elif last_bot_message_text:
+                # Cerca nell'ultimo messaggio del bot (es. "Ordine creato: S00051")
+                match = re.search(r'(?:Ordine creato|Order|S00|SO):\s*(SO?\d+|S\d{5})', last_bot_message_text, re.I)
+                if match:
+                    order_name = match.group(1).upper()
+            
+            _logger.info(f"Intent chiaro: CONFIRM (order: {order_name or 'da ultimo bot msg'})")
+            return ('confirm', order_name)
+        
+        # STEP 2: Ambiguo → chiedi all'LLM (task-specific prompt)
+        _logger.info(" Intent ambiguo, uso LLM classifier...")
+        try:
+            config = self.env['ai.config'].get_active_config()
+            
+            context_msg = f"Ultimo bot: {last_bot_message_text[:150]}" if last_bot_message_text else "Nessun contesto"
+            
+            prompt = (
+                "Classifica l'intent di questo messaggio utente.\n"
+                "Rispondi SOLO con: 'CREATE' o 'CONFIRM' o 'UNCLEAR'\n\n"
+                "- CREATE: vuole creare un NUOVO ordine di vendita\n"
+                "- CONFIRM: vuole confermare/validare un ordine ESISTENTE (già in bozza)\n"
+                "- UNCLEAR: non è chiaro o è un'altra azione\n\n"
+                f"{context_msg}\n\n"
+                f"Messaggio utente: {user_message}\n\n"
+                "RISPONDI UNA SOLA PAROLA: CREATE o CONFIRM o UNCLEAR"
+            )
+            
+            response = self._get_gemini_response(config, [{'role': 'user', 'content': prompt}])
+            intent_str = response.strip().upper()
+            
+            if 'CREATE' in intent_str:
+                _logger.info(f"LLM classifier: CREATE")
+                return ('create', None)
+            elif 'CONFIRM' in intent_str:
+                # Estrai order_name come sopra
+                order_name = None
+                match = re.search(r'\b(SO?\d+|S\d{5})\b', user_message + (last_bot_message_text or ''), re.I)
+                if match:
+                    order_name = match.group(1).upper()
+                _logger.info(f"LLM classifier: CONFIRM (order: {order_name})")
+                return ('confirm', order_name)
+            else:
+                _logger.info(f"LLM classifier: UNCLEAR → None")
+                return (None, None)
+        
+        except Exception as e:
+            _logger.error(f"Intent classification failed: {e}", exc_info=True)
+            return (None, None)
+    
+    @api.model
+    def _get_gemini_response(self, config, messages, retry_count=0, max_retries=2):
+        """Dispatcher LLM: usa Gemini o OpenRouter in base al provider.
+
+        Args:
+            config: record `ai.config` attivo
+            messages: lista di dict `{"role": "user"|"assistant", "content": "..."}`
+        """
+
+        provider = (config.provider or 'gemini').lower()
+        if provider == 'openrouter':
+            return self._call_openrouter(config, messages)
+
+        # Default: comportamento attuale Gemini
+        return self._call_gemini(config, messages, retry_count=retry_count, max_retries=max_retries)
+
+    @api.model
+    def _call_gemini(self, config, messages, retry_count=0, max_retries=2):
+        """Chiama l'API di Gemini con retry automatico su errori 503."""
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{config.model_name}:generateContent"
         
         # Costruisci il payload per Gemini
         contents = []
         
-        # Aggiungi messaggi della conversazione (SENZA system prompt come messaggi finti)
+        # Aggiungi messaggi della conversazione (SENZA system prompt)
         for msg in messages:
             role = "user" if msg['role'] == 'user' else "model"
             contents.append({
@@ -87,7 +252,7 @@ class DiscussChannel(models.Model):
                 "parts": [{"text": msg['content']}]
             })
         
-        # Costruisci payload con system_instruction nativo di Gemini
+        # payload con system_instruction nativo di Gemini
         payload = {
             "contents": contents,
             "generationConfig": {
@@ -95,8 +260,8 @@ class DiscussChannel(models.Model):
                 "maxOutputTokens": config.max_tokens,
             }
         }
-        
-        # Aggiungi system_instruction se il prompt è definito
+
+        # Aggiungo system_instruction se il prompt è definito
         if config.system_prompt:
             payload["system_instruction"] = {
                 "parts": [{"text": config.system_prompt}]
@@ -105,6 +270,9 @@ class DiscussChannel(models.Model):
         else:
             _logger.debug("System instruction omesso (prompt vuoto/None)")
         
+        # Scegli la chiave corretta (campo provider-specifico se presente)
+        api_key = config.gemini_api_key or config.api_key
+
         headers = {
             "Content-Type": "application/json"
         }
@@ -112,7 +280,7 @@ class DiscussChannel(models.Model):
         try:
             response = requests.post(
                 url,
-                params={"key": config.api_key},
+                params={"key": api_key},
                 headers=headers,
                 json=payload,
                 timeout=30
@@ -121,24 +289,24 @@ class DiscussChannel(models.Model):
             
             data = response.json()
             
-            # Log completo della risposta per debug
+            # debug
             _logger.info(f"Gemini API response: {json.dumps(data, indent=2)}")
             
-            # Gestione robusta della risposta
+            # Gestione risposta
             if 'candidates' not in data or len(data['candidates']) == 0:
                 _logger.error(f"Nessun candidate nella risposta Gemini: {data}")
                 return "Errore: risposta API senza risultati"
             
             candidate = data['candidates'][0]
             
-            # Controlla se la risposta è stata bloccata dai safety filters
+            # Controllo safety filters
             if 'finishReason' in candidate and candidate['finishReason'] != 'STOP':
                 finish_reason = candidate.get('finishReason', 'UNKNOWN')
                 safety_ratings = candidate.get('safetyRatings', [])
                 _logger.warning(f"Risposta bloccata: {finish_reason}, safety: {safety_ratings}")
                 return f"La risposta è stata bloccata per motivi di sicurezza ({finish_reason})"
             
-            # Estrai il testo in modo sicuro
+            # Estrazione testo
             if 'content' not in candidate:
                 _logger.error(f"Campo 'content' mancante in candidate: {candidate}")
                 return "Errore: risposta API malformata (manca 'content')"
@@ -156,14 +324,114 @@ class DiscussChannel(models.Model):
             return text
                 
         except requests.exceptions.RequestException as e:
+            error_msg = str(e)
+            
+            # 🆕 RETRY AUTOMATICO su errori 503 (Service Unavailable)
+            if '503' in error_msg and retry_count < max_retries:
+                import time
+                wait_time = (retry_count + 1) * 2  # Backoff esponenziale: 2s, 4s, 6s...
+                _logger.warning(f"⚠️ Errore 503 da Gemini (tentativo {retry_count + 1}/{max_retries + 1}) - riprovo tra {wait_time}s...")
+                time.sleep(wait_time)
+                return self._get_gemini_response(config, messages, retry_count=retry_count + 1, max_retries=max_retries)
+            
             _logger.error(f"Errore chiamata Gemini API: {e}")
-            return f"Errore di connessione all'AI: {str(e)}"
+            
+            # 🆕 Messaggio di errore più user-friendly per errori temporanei
+            if '503' in error_msg:
+                return "⚠️ Il servizio AI è temporaneamente sovraccarico. Riprova tra qualche secondo."
+            elif '429' in error_msg:
+                return "⚠️ Limite richieste API raggiunto. Attendi qualche secondo prima di riprovare."
+            else:
+                return f"Errore di connessione all'AI: {error_msg}"
+                
         except KeyError as e:
             _logger.error(f"Errore parsing risposta Gemini: {e}, data: {data if 'data' in locals() else 'N/A'}")
             return f"Errore: formato risposta API non valido ({e})"
         except Exception as e:
             _logger.error(f"Errore imprevisto Gemini: {e}", exc_info=True)
             return f"Errore imprevisto: {str(e)}"
+
+    @api.model
+    def _call_openrouter(self, config, messages):
+        """Chiama OpenRouter (endpoint stile OpenAI chat/completions)."""
+
+        url = "https://openrouter.ai/api/v1/chat/completions"
+
+        # Mappa i messaggi nel formato OpenAI-like
+        chat_messages = []
+        system_prompt = (config.system_prompt or '').strip()
+        if system_prompt:
+            chat_messages.append({
+                "role": "system",
+                "content": system_prompt,
+            })
+
+        for msg in messages:
+            role = msg.get('role') or 'user'
+            if role not in ('user', 'assistant', 'system'):
+                role = 'user'
+            chat_messages.append({
+                "role": role,
+                "content": msg.get('content', ''),
+            })
+
+        payload = {
+            "model": config.model_name,
+            "messages": chat_messages,
+            "temperature": config.temperature,
+        }
+
+        # Usa max_tokens se presente nel modello (anche se nascosto dalla vista)
+        if getattr(config, 'max_tokens', None):
+            try:
+                mt = int(config.max_tokens)
+                if mt > 0:
+                    payload["max_tokens"] = mt
+            except Exception:
+                pass
+
+        # Usa chiave OpenRouter specifica se impostata, altrimenti fallback al campo legacy
+        api_key = config.openrouter_api_key or config.api_key
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=30,
+            )
+            response.raise_for_status()
+
+            data = response.json()
+            _logger.info(f"OpenRouter API response: {json.dumps(data, indent=2)}")
+
+            choices = data.get('choices') or []
+            if not choices:
+                _logger.error(f"Nessun choice nella risposta OpenRouter: {data}")
+                return "Errore: risposta API senza risultati"
+
+            message = choices[0].get('message') or {}
+            content = message.get('content', '')
+            if not content:
+                _logger.warning(f"Testo vuoto nella risposta OpenRouter: {message}")
+                return "Errore: risposta AI vuota"
+
+            return content
+
+        except requests.exceptions.RequestException as e:
+            _logger.error(f"Errore chiamata OpenRouter API: {e}")
+            msg = str(e)
+            if '429' in msg:
+                return "⚠️ Limite richieste API OpenRouter raggiunto. Attendi qualche secondo prima di riprovare."
+            return f"Errore di connessione all'AI (OpenRouter): {msg}"
+        except Exception as e:
+            _logger.error(f"Errore imprevisto OpenRouter: {e}", exc_info=True)
+            return f"Errore imprevisto (OpenRouter): {str(e)}"
     
     @api.model
     def _get_available_functions(self):
@@ -183,9 +451,11 @@ class DiscussChannel(models.Model):
                 }
             },
             "search_products": {
-                "description": "Cerca prodotti nel catalogo",
+                "description": "Cerca prodotti nel catalogo. Supporta filtro per tipo: beni fisici, servizi, combo",
                 "parameters": {
-                    "search_term": "Termine di ricerca (opzionale)"
+                    "search_term": "Termine di ricerca (opzionale)",
+                    "limit": "Numero massimo risultati (default 50)",
+                    "product_type": "Filtra per tipo (opzionale): 'product' (beni fisici/goods), 'service' (servizio), 'combo' (prodotto combo), None (tutti i tipi)"
                 }
             },
             "get_pending_orders": {
@@ -250,12 +520,26 @@ class DiscussChannel(models.Model):
                 }
             },
             "update_sales_order": {
-                "description": "Aggiorna un Sales Order esistente (SOLO in stato draft/sent): modifica quantità, aggiungi/rimuovi righe, cambia data consegna. NON funziona su ordini già confermati",
+                "description": "Aggiorna un Sales Order esistente (SOLO in stato draft/sent): modifica quantità, aggiungi/rimuovi righe, cambia data consegna. NON funziona su ordini già confermati. SUPPORTA product_name per ricerca automatica prodotto!",
                 "parameters": {
                     "order_name": "Nome ordine (es. 'SO042') OPPURE",
                     "order_id": "ID numerico dell'ordine",
-                    "order_lines_updates": "Lista modifiche: [{'line_id': 123, 'quantity': 10}, {'product_id': 25, 'quantity': 5}, {'line_id': 124, 'delete': True}]",
+                    "order_lines_updates": "Lista modifiche: [{'line_id': 123, 'quantity': 10}, {'product_id': 25, 'quantity': 5}, {'product_name': 'sedia ufficio', 'quantity': 3}, {'line_id': 124, 'delete': True}]",
                     "scheduled_date": "Data consegna pianificata (formato ISO: '2025-10-21' o '2025-10-21 14:00:00') - OPZIONALE"
+                }
+            },
+            "confirm_sales_order": {
+                "description": "Conferma un Sales Order passandolo da draft/sent a sale. Genera automaticamente i Delivery Order. Usa questa funzione quando l'utente vuole confermare, validare o far passare un ordine a 'sale order'",
+                "parameters": {
+                    "order_name": "Nome ordine (es. 'S00042') OPPURE",
+                    "order_id": "ID numerico dell'ordine"
+                }
+            },
+            "cancel_sales_order": {
+                "description": "Cancella un Sales Order (stato -> cancel). Cancella automaticamente i Delivery NON ancora evasi. NON può cancellare ordini con delivery già validati. Usa quando l'utente vuole annullare, cancellare o eliminare un ordine",
+                "parameters": {
+                    "order_name": "Nome ordine (es. 'S00042') OPPURE",
+                    "order_id": "ID numerico dell'ordine"
                 }
             },
             "update_delivery": {
@@ -315,12 +599,17 @@ class DiscussChannel(models.Model):
                 return warehouse_ops.search_partners(**call_params)
             elif function_name == 'search_products':
                 call_params = dict(parameters)
+                
+                # NORMALIZZA SEARCH TERM: plurali italiani singolare + rimuovi articoli
+                if 'search_term' in call_params:
+                    call_params['search_term'] = self._normalize_product_search_term(call_params['search_term'])
+                
                 # Cast limit to int (AI può passarlo come stringa)
                 if 'limit' in call_params:
                     try:
                         call_params['limit'] = int(call_params['limit'])
                     except (TypeError, ValueError):
-                        call_params['limit'] = 100  # ✅ Default più alto per "mostra tutti"
+                        call_params['limit'] = 100  
                 else:
                     # Se l'AI non specifica limit, usa un valore alto per "mostra tutti"
                     call_params['limit'] = 100
@@ -329,8 +618,8 @@ class DiscussChannel(models.Model):
                 
                 # LOG DEBUG: verifica che list_price sia presente
                 _logger.info(f"=== search_products: {len(result)} risultati (limit={call_params.get('limit')}) ===")
-                for prod in result[:5]:  # Mostra solo i primi 5 per non intasare log
-                    _logger.info(f"  • {prod['name']} (ID: {prod['id']}) - €{prod.get('list_price', 'N/A')} - {prod.get('qty_available', 'N/A')} unità")
+                for prod in result[:5]: 
+                    _logger.info(f"  • {prod['name']} (ID: {prod['id']}) - €{prod.get('list_price', 'N/A')} - {prod.get('qty_available', 'N/A')} unità - tipo: {prod.get('detailed_type', 'N/A')}")
                 if len(result) > 5:
                     _logger.info(f"  ... e altri {len(result) - 5} prodotti")
                 _logger.info(f"=====================================")
@@ -510,6 +799,30 @@ class DiscussChannel(models.Model):
                 
                 return warehouse_ops.update_sales_order(**call_params)
             
+            elif function_name == 'confirm_sales_order':
+                call_params = dict(parameters)
+                
+                # Converti order_id se presente
+                if 'order_id' in call_params:
+                    try:
+                        call_params['order_id'] = int(call_params['order_id'])
+                    except (TypeError, ValueError):
+                        return {"error": "order_id deve essere un numero"}
+                
+                return warehouse_ops.confirm_sales_order(**call_params)
+            
+            elif function_name == 'cancel_sales_order':
+                call_params = dict(parameters)
+                
+                # Converti order_id se presente
+                if 'order_id' in call_params:
+                    try:
+                        call_params['order_id'] = int(call_params['order_id'])
+                    except (TypeError, ValueError):
+                        return {"error": "order_id deve essere un numero"}
+                
+                return warehouse_ops.cancel_sales_order(**call_params)
+            
             elif function_name == 'update_delivery':
                 call_params = dict(parameters)
                 
@@ -533,7 +846,23 @@ class DiscussChannel(models.Model):
                         call_params['order_id'] = int(call_params['order_id'])
                     except (TypeError, ValueError):
                         return {"error": "order_id deve essere un numero"}
-                return warehouse_ops.get_sales_order_details(**call_params)
+                
+                # 🔧 SUPPORTO FLAG "internal" per chiamate silenziose
+                # Se internal=true, ritorna solo il JSON grezzo senza formattazione
+                # Serve per workflow multi-step dove l'AI deve estrarre line_id
+                # e continuare con update_sales_order nello stesso turno
+                is_internal = call_params.pop('internal', False)
+                if isinstance(is_internal, str):
+                    is_internal = is_internal.lower() in ('true', '1', 'yes')
+                
+                result = warehouse_ops.get_sales_order_details(**call_params)
+                
+                # Se chiamata interna, aggiungi marker per impedire formattazione
+                if is_internal:
+                    if isinstance(result, dict):
+                        result['_internal_call'] = True  # Marker per odoobot_override.py
+                
+                return result
             
             elif function_name == 'get_top_customers':
                 return warehouse_ops.get_top_customers(**parameters)
@@ -553,12 +882,12 @@ class DiscussChannel(models.Model):
         Analizza la risposta dell'AI per individuare tutte le funzioni richieste.
         Restituisce una lista di tuple (function_name, parameters) e la risposta senza tag.
         """
-        # Pattern migliorato: trova [FUNCTION:nome] (case-insensitive) e cattura tutto
-        # fino alla ']' corrispondente, gestendo annidamenti di [] nei parametri.
+        # trova [FUNCTION:nome] (case-insensitive) e cattura tutto
+        # fino alla ']' corrispondente
         function_calls = []
         clean_response = ai_response
         
-        # Cerca tutti i tag FUNCTION nell'ordine in cui appaiono (case-insensitive)
+        # Cerca tutti i tag FUNCTION nell'ordine in cui appaiono senza guardare 
         idx = 0
         tag_re = re.compile(r"\[(?:FUNCTION|Function|function):")
         while idx < len(clean_response or ""):
@@ -646,7 +975,7 @@ class DiscussChannel(models.Model):
                     key = key.strip()
                     value = value.strip()
                     
-                    # Prova a parsare come JSON
+                    # Provo a parsare come JSON
                     if value.startswith('[') or value.startswith('{'):
                         try:
                             value = json.loads(value)
@@ -691,11 +1020,11 @@ class DiscussChannel(models.Model):
             if author.name in ['OdooBot', 'System', 'AI Assistant']:
                 return result
             
-            # 🚨 STEP 0: Check for pending sales order confirmation BEFORE calling AI
+            # controllo se ci sono ordini di vendita in attesa prima di chiamare l'ai
             user_message = re.sub(r'<[^>]+>', '', body or '').strip()
 
             if re.search(r'\b(S[IÌI]|CONFERMO|OK\s*VAI|PERFETTO)\b', user_message, re.I):
-                _logger.info("🔍 Possibile conferma rilevata, verifico marker [PENDING_SO]")
+                _logger.info("Possibile conferma rilevata, verifico marker [PENDING_SO]")
 
                 bot_partner_ids = []
                 for xmlid in ('base.partner_root', 'base.partner_odoobot'):
@@ -715,7 +1044,7 @@ class DiscussChannel(models.Model):
                         msg_text = re.sub(r'<[^>]+>', '', last_bot_msg.body or '').strip()
                         _logger.debug(f"Ultimo messaggio bot (200 char): {msg_text[:200]}")
 
-                        # Usa parser a contatore di graffe per JSON annidati
+                        # Uso parser a contatore di graffe per JSON annidati
                         text = msg_text
                         idx = text.find(PENDING_SO_MARKER)
                         if idx != -1:
@@ -733,7 +1062,7 @@ class DiscussChannel(models.Model):
                                             break
                                 if end:
                                     json_str = text[jstart:end]
-                                    _logger.info("✅ Marker [PENDING_SO] trovato: eseguo create_sales_order senza AI")
+                                    _logger.info("Marker [PENDING_SO] trovato: eseguo create_sales_order senza AI")
                                     try:
                                         params = json.loads(json_str)
 
@@ -788,7 +1117,7 @@ class DiscussChannel(models.Model):
                                     except Exception as e:
                                         _logger.error(f"Errore durante l'esecuzione diretta di create_sales_order: {e}", exc_info=True)
                         else:
-                            _logger.info("❌ Nessun marker [PENDING_SO] trovato nell'ultimo messaggio del bot")
+                            _logger.info("Nessun marker [PENDING_SO] trovato nell'ultimo messaggio del bot")
                     else:
                         _logger.info("ℹ️ Nessun messaggio del bot trovato per verificare la conferma")
             
@@ -805,19 +1134,78 @@ class DiscussChannel(models.Model):
             # Costruisci la storia della conversazione
             messages = []
             
-            # NOTA: Non aggiungiamo più functions_desc qui per risparmiare token
+            # NOTA: Non aggiungo più functions_desc qui per risparmiare token
             # Il System Prompt contiene già tutte le istruzioni necessarie
-            # functions_desc consumava ~500 token ad ogni messaggio!
+            # functions_desc mi consumava ~500 token ad ogni messaggio!
+            
+            # 🆕 CONTEXT INJECTION: Rileva se utente menziona "preventivo/ordine" per modifiche multi-prodotto
+            user_lower = user_message.lower()
+            order_keywords = ['preventivo', 'ordine', 'aggiungi al', 'modifica', 'aggiorna', 'al preventivo', "all'ordine", 'rimuovi dal', 'togli dal']
+            
+            context_enriched_message = user_message
+            
+            if any(kw in user_lower for kw in order_keywords):
+                _logger.info("🔍 Utente menziona ordine/preventivo - cerco context")
+                
+                target_order = None
+                
+                # 1. Cerca se utente ha menzionato un numero ordine specifico
+                import re
+                order_num_match = re.search(r'(?:ordine|preventivo|s00)[\s:]*(\d+)', user_lower)
+                if order_num_match:
+                    order_num = order_num_match.group(1)
+                    _logger.info(f"🎯 Utente ha specificato ordine numero: {order_num}")
+                    
+                    # Prova a trovare per nome (S00XXX) o ID
+                    target_order = self.env['sale.order'].search([
+                        '|',
+                        ('name', '=', f'S00{order_num}'),
+                        ('id', '=', int(order_num))
+                    ], limit=1)
+                
+                # 2. Se non specificato, cerca ultimo draft
+                if not target_order:
+                    _logger.info("📋 Nessun numero specificato - cerco ultimo draft")
+                    target_order = self.env['sale.order'].search([
+                        ('state', 'in', ['draft', 'sent'])
+                    ], order='date_order desc', limit=1)
+                
+                if target_order:
+                    _logger.info(f"✅ Trovato ordine: {target_order.name} (ID: {target_order.id})")
+                    
+                    # Costruisci righe ordine per context
+                    lines_text = []
+                    for line in target_order.order_line:
+                        lines_text.append(
+                            f"  • line_id={line.id}: {line.product_id.name} ({line.product_uom_qty} pz) - €{line.price_unit}"
+                        )
+                    
+                    # Arricchisci il messaggio con context
+                    context_enriched_message = (
+                        f"📋 CONTESTO: Ordine target:\n"
+                        f"- order_name: {target_order.name}\n"
+                        f"- order_id: {target_order.id}\n"
+                        f"- Cliente: {target_order.partner_id.name}\n"
+                        f"- Righe attuali ({len(target_order.order_line)}):\n" + "\n".join(lines_text) + "\n\n"
+                        f"⚠️ IMPORTANTE:\n"
+                        f"- Per AGGIUNGERE prodotti: genera MULTIPLE [FUNCTION:search_products] (una per prodotto) poi UN update_sales_order batch\n"
+                        f"- Per RIMUOVERE righe: usa [FUNCTION:update_sales_order|order_id:{target_order.id}|order_lines_updates:[{{\"line_id\":ID,\"delete\":true}}]]\n"
+                        f"- Usa order_id:{target_order.id} per tutte le operazioni\n\n"
+                        f"Messaggio utente: {user_message}"
+                    )
+                    _logger.info(f"✅ Context injection attivato per ordine {target_order.name}")
+                else:
+                    _logger.info("ℹ️ Nessun ordine trovato per context injection")
             
             messages.append({
                 'role': 'user',
-                'content': user_message
+                'content': context_enriched_message
             })
             
             # Ottieni risposta dall'AI
             ai_response = self._get_gemini_response(config, messages)
-            
-            # LOG DETTAGLIATO per debug
+
+            # LOG DETTAGLIATO
             _logger.info(f"========== AI RAW RESPONSE ==========")
             _logger.info(f"Response type: {type(ai_response)}")
             _logger.info(f"Response length: {len(ai_response) if ai_response else 0}")
@@ -829,14 +1217,14 @@ class DiscussChannel(models.Model):
             function_calls, clean_response = self._parse_ai_function_calls(ai_response)
             
             # Se il parser non ha trovato nulla ma la risposta contiene '[FUNCTION:',
-            # proviamo una pulizia aggressiva e riproviamo
+            # provo una pulizia piu stringente
             if not function_calls and '[FUNCTION:' in (ai_response or ''):
                 _logger.warning("Parser non ha trovato FUNCTION ma la stringa li contiene. Cleaning + fallback...")
                 try:
                     # 1) Pulizia base
                     cleaned = re.sub(r'```.*?```', '', ai_response, flags=re.S)   # rimuovi code blocks
-                    cleaned = cleaned.replace('`', '')                            # rimuovi backticks sparsi
-                    # normalizza newline DENTRO al tag (case-insensitive su 'function')
+                    cleaned = cleaned.replace('`', '')                            # rimuovi backticks
+                    # normalizza newline DENTRO al tag 
                     cleaned = re.sub(
                         r'\[(?:FUNCTION|Function|function):([^\]]+)\]',
                         lambda m: '[FUNCTION:' + m.group(1).replace('\n','').replace('\r','') + ']',
@@ -845,19 +1233,19 @@ class DiscussChannel(models.Model):
                     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
                     _logger.info(f"Cleaned response: {repr(cleaned)}")
 
-                    # 2) Riprova il parser "ricco"
+                    # 2) Riprova il parser 
                     function_calls, clean_response = self._parse_ai_function_calls(cleaned)
                     if not function_calls:
-                        # 3) Fallback: tag senza parametri -> {} (es. [FUNCTION:search_products])
+                        # 3) Fallback: tag senza parametri (es. [FUNCTION:search_products])
                         bare = re.findall(r'\[(?:FUNCTION|Function|function):\s*([A-Za-z0-9_]+)\s*\]', cleaned)
                         if bare:
                             function_calls = [(name.strip(), {}) for name in bare]
                             clean_response = re.sub(r'\[(?:FUNCTION|Function|function):[^\]]+\]', '', cleaned).strip()
-                            _logger.info(f"✅ Fallback bare FUNCTION: create {len(function_calls)} call(s) with empty params.")
+                            _logger.info(f"Fallback bare FUNCTION: create {len(function_calls)} call(s) with empty params.")
                         else:
-                            _logger.error(f"❌ Anche dopo cleaning/fallback non trovo tag. cleaned={cleaned}")
+                            _logger.error(f"Anche dopo cleaning/fallback non trovo tag. cleaned={cleaned}")
 
-                    # 4) Se abbiamo trovato qualcosa, usa la versione pulita come base
+                    # 4) Se abbiamo trovato qualcosa, uso la versione base
                     if function_calls:
                         ai_response = cleaned
 
@@ -877,24 +1265,23 @@ class DiscussChannel(models.Model):
                     result = self._execute_function(function_name, parameters)
                     executed_calls.append((function_name, parameters, result))
 
-                # Prepara il messaggio con i risultati per uso interno (summary)
+                # uso interno 
                 summary_blocks = []
                 for function_name, parameters, result in executed_calls:
                     summary_blocks.append(
                         f"Risultato della funzione {function_name} con parametri {json.dumps(parameters)}: {json.dumps(result, indent=2)}"
                     )
 
-                # Se abbiamo almeno una funzione di scrittura/creazione, NON chiedere
-                # all'LLM di riformattare: compongo io la conferma e la pubblico.
+                # Se abbiamo almeno una funzione di scrittura/creazione,compongo io la conferma e la pubblico.
                 mutating_fns = {'create_sales_order', 'create_partner', 'create_delivery_order', 'validate_delivery'}
                 if any(fn in mutating_fns for fn, _, _ in executed_calls):
                     final_response = None
                     
                     for function_name, parameters, result in executed_calls:
-                        # 🚨 GATE: Se il risultato richiede conferma, usa SOLO il messaggio formattato
+                        #Se il risultato richiede conferma, uso SOLO il messaggio formattato
                         if isinstance(result, dict) and result.get('requires_confirmation'):
                             _logger.info("✅ Richiesta conferma per create_sales_order - uso SOLO il campo 'message'")
-                            # ✅ FIX: Usa SOLO il messaggio, NON tutto il dict
+                          
                             final_response = result.get('message', 'Confermi?')
                             break
                     
@@ -902,14 +1289,13 @@ class DiscussChannel(models.Model):
                     if final_response is None:
                         lines = []
                         for function_name, parameters, result in executed_calls:
-                            # Error handling
                             if isinstance(result, dict) and result.get('error'):
                                 lines.append(f"⚠️ Errore eseguendo {function_name}: {result.get('error')}")
                                 if result.get('details'):
                                     lines.append(result.get('details'))
                                 continue
 
-                            # Success - formatta i risultati più importanti in modo leggibile
+                            # Success - formatta i risultati 
                             if function_name == 'create_sales_order':
                                 order_name = result.get('sale_order_name') or result.get('order_name')
                                 order_id = result.get('sale_order_id') or result.get('order_id')
@@ -937,7 +1323,7 @@ class DiscussChannel(models.Model):
                         final_response = "\n\n".join(lines) if lines else "Operazione completata."
 
                 else:
-                    # Nessuna operazione mutante: possiamo chiedere all'LLM di formattare la risposta
+                    #chiedere all'LLM di formattare la risposta
                     follow_up_messages = messages + [
                         {'role': 'assistant', 'content': clean_response if clean_response else "Ho capito, ecco i risultati."},
                         {'role': 'user', 'content': "\n\n".join(summary_blocks) + 
@@ -954,12 +1340,12 @@ class DiscussChannel(models.Model):
 
                     final_response = (self._get_gemini_response(config, follow_up_messages) or "").strip()
 
-                    # Rimuovi eventuali tag [FUNCTION:...] dalla risposta finale (doppia sicurezza)
+                    # Rimuovi eventuali tag [FUNCTION:...] dalla risposta finale
                     if '[FUNCTION:' in final_response:
                         _logger.warning(f"AI ha incluso tag FUNCTION nella risposta finale, li rimuovo: {final_response}")
                         final_response = re.sub(r'\[FUNCTION:[^\]]+\]', '', final_response).strip()
 
-                    # Se la risposta finale è ancora vuota, usa un fallback
+                    # fallback
                     if not final_response:
                         fallback_lines = []
                         for function_name, parameters, result in executed_calls:
@@ -968,19 +1354,19 @@ class DiscussChannel(models.Model):
                         final_response = "\n".join(fallback_lines) if fallback_lines else "Nessuna informazione disponibile."
 
             else:
-                # Nessuna funzione da eseguire, usa la risposta diretta
+                # Nessuna funzione da eseguire, risposta diretta
                 final_response = clean_response if clean_response else ai_response
 
             final_response = final_response or "Nessuna informazione disponibile."
 
-            # Rimuovi eventuali tag [FUNCTION:...] residui dalla risposta finale (sicurezza)
+            # Rimuovi eventuali tag [FUNCTION:...] residui dalla risposta finale
             try:
                 if final_response and '[FUNCTION:' in final_response:
                     final_response = re.sub(r'\[FUNCTION:[^\]]+\]', '', final_response).strip()
             except Exception:
                 pass
 
-            # Formatta con HTML (usa la stessa funzione di odoobot_override.py)
+            # Formatta con HTML
             formatted_response = format_html_response(final_response)
 
             # Invia la risposta nella chat

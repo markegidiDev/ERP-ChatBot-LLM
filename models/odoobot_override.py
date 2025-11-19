@@ -90,6 +90,71 @@ def _parse_iso_duration(dur):
 class MailBot(models.AbstractModel):
     _inherit = 'mail.bot'
 
+    def _build_sales_order_summary(self, order):
+        """
+        Costruisce il riepilogo di un ordine di vendita/preventivo leggendo SEMPRE dal DB.
+        Invalida la cache prima di leggere per garantire dati freschi.
+        
+        Args:
+            order: recordset sale.order
+            
+        Returns:
+            str: Testo formattato del riepilogo con prodotti e totali
+        """
+        if not order or not order.exists():
+            return "⚠️ Ordine non trovato o eliminato."
+        
+        # FORZA rilettura dal DB di righe e totali (evita cache stale)
+        order.invalidate_recordset()
+        
+        # Prepara lista prodotti
+        lines = []
+        for line in order.order_line:
+            # Forza refresh anche delle singole righe
+            line.invalidate_recordset()
+            
+            qty = int(line.product_uom_qty or 0)
+            price_unit = line.price_unit or 0.0
+            
+            # Usa price_total (con tasse) se ci sono tasse, altrimenti price_subtotal
+            if line.tax_id:
+                price_display = line.price_total or 0.0
+                price_label = "con tasse"
+            else:
+                price_display = price_unit
+                price_label = ""
+            
+            subtotal = line.price_subtotal or 0.0
+            
+            product_name = line.product_id.display_name or line.product_id.name or "Prodotto sconosciuto"
+            
+            if price_label:
+                lines.append(f"  • {product_name} — Qtà: {qty} — €{price_display:.2f} ({price_label}) — Subtot: €{subtotal:.2f}")
+            else:
+                lines.append(f"  • {product_name} — Qtà: {qty} — €{price_unit:.2f} — Subtot: €{subtotal:.2f}")
+        
+        # Componi il riepilogo
+        state_display = dict(order._fields['state'].selection).get(order.state, order.state)
+        
+        summary_parts = [
+            f"📄 Riepilogo {order.name}",
+            f"👤 Cliente: {order.partner_id.name}",
+            f"📊 Stato: {state_display}",
+            "",
+            f"📦 Prodotti ({len(lines)}):",
+        ]
+        
+        summary_parts.extend(lines)
+        
+        summary_parts.extend([
+            "",
+            f"💰 Imponibile: €{order.amount_untaxed:.2f}",
+            f"💰 Imposte: €{order.amount_tax:.2f}",
+            f"💰 Totale: €{order.amount_total:.2f}",
+        ])
+        
+        return "\n".join(summary_parts)
+
     def _llm_when_to_datetime(self, user_text):
         """
         Chiede all'AI di normalizzare 'quando' dal testo utente.
@@ -297,6 +362,95 @@ class MailBot(models.AbstractModel):
         try:
             config = self.env['ai.config'].get_active_config()
             
+            # STEP 0: INTERCETTA RICHIESTE DI RIEPILOGO ORDINE (bypass AI)
+            # Pattern: "riepilogo S00064", "dettagli ordine 62", "S00064", "ordine SO123"
+            order_pattern = r'\b(?:riepilogo|dettagli?|info|mostra|vedi|dammi)\s*(?:ordine|preventivo|SO)?\s*[:\s]?\s*([Ss]0*\d+|SO\d+|ordine\s+\d+)'
+            simple_code = r'^[Ss]0*\d+$|^SO\d+$'
+            
+            match = re.search(order_pattern, user_message, re.I)
+            if match or re.match(simple_code, user_message.strip()):
+                # Estrai il codice ordine
+                if match:
+                    code_raw = match.group(1)
+                else:
+                    code_raw = user_message.strip()
+                
+                # Normalizza: "ordine 64" → "S00064", "SO123" → "SO123", "s64" → "S00064"
+                if re.match(r'^ordine\s+(\d+)$', code_raw, re.I):
+                    order_num = re.search(r'\d+', code_raw).group()
+                    order_name = f"S{order_num.zfill(5)}"
+                elif re.match(r'^[Ss]0*(\d+)$', code_raw):
+                    order_num = re.search(r'\d+', code_raw).group()
+                    order_name = f"S{order_num.zfill(5)}"
+                else:
+                    order_name = code_raw.upper()
+                
+                _logger.warning(f"🚀 BYPASS AI: Richiesta riepilogo ordine '{order_name}' (input: '{user_message}')")
+                
+                # Chiama direttamente get_sales_order_details
+                warehouse_ops = self.env['warehouse.operations']
+                result = warehouse_ops.get_sales_order_details(order_name=order_name)
+                
+                _logger.warning(f"🔍 BYPASS: result type={type(result)}, has error={result.get('error') if isinstance(result, dict) else 'N/A'}")
+                
+                # Formatta la risposta usando la logica esistente
+                if isinstance(result, dict) and result.get('error'):
+                    return format_html_response(f"⚠️ {result.get('error')}")
+                
+                # 🆕 FORZA RELOAD ORDINE DAL DB PRIMA DI FORMATTARE
+                try:
+                    order_id = result.get('order_id')
+                    SaleOrder = self.env['sale.order']
+                    order = SaleOrder.browse(order_id)
+                    
+                    if order and order.exists():
+                        # Invalida cache completa
+                        order.invalidate_recordset()
+                        order.order_line.invalidate_recordset()
+                        
+                        # 🔥 COMMIT ESPLICITO per forzare lettura dati freschi dal DB
+                        self.env.cr.commit()
+                        
+                        # Ricarica ordine dal DB
+                        order = SaleOrder.browse(order_id)
+                        
+                        _logger.warning(f"🔄 BYPASS: Ordine ricaricato dal DB - righe attuali: {len(order.order_line)}")
+                    
+                    if order and order.exists():
+                        summary = self._build_sales_order_summary(order)
+                        
+                        # Aggiungi info extra
+                        extra_info = []
+                        if result.get('partner_email'):
+                            extra_info.append(f"📧 Email: {result.get('partner_email')}")
+                        if result.get('partner_phone'):
+                            extra_info.append(f"📞 Tel: {result.get('partner_phone')}")
+                        
+                        status = result.get('delivery_status') or result.get('delivery_status_computed')
+                        if status:
+                            labels = {
+                                'nothing_to_deliver': 'Nulla da consegnare',
+                                'not_delivered': 'Non consegnato',
+                                'partially_delivered': 'Parzialmente consegnato',
+                                'fully_delivered': 'Consegnato',
+                            }
+                            extra_info.append(f"🚚 Consegna: {labels.get(status, status)}")
+                        
+                        pickings = result.get('pickings', [])
+                        if pickings:
+                            extra_info.append("")
+                            extra_info.append(f"🚚 Consegne ({len(pickings)}):")
+                            for p in pickings:
+                                extra_info.append(f"  • {p.get('picking_name')} - Stato: {p.get('state_display', p.get('state'))}")
+                        
+                        final_text = summary + ("\n\n" + "\n".join(extra_info) if extra_info else "")
+                        return format_html_response(final_text)
+                    else:
+                        return format_html_response(f"⚠️ Ordine {order_name} non trovato")
+                except Exception as e:
+                    _logger.error(f"Errore formattando riepilogo bypass: {e}", exc_info=True)
+                    return format_html_response(f"⚠️ Errore: {str(e)}")
+            
             # STEP 1: Check for pending sales order confirmation
             pending_so_json = self._check_pending_sales_order(channel, user_message)
             if pending_so_json:
@@ -353,7 +507,7 @@ class MailBot(models.AbstractModel):
             
             # STEP 2: Check if user cancelled pending order
             if self._is_cancellation(user_message) and self._has_pending_marker(channel):
-                return format_html_response("✅ Ordine annullato.")
+                return format_html_response("❌ Operazione annullata: non procedo con la creazione del preventivo.")
             
             # Prepara il contesto delle funzioni disponibili
             functions_context = self._get_functions_context()
@@ -411,12 +565,74 @@ class MailBot(models.AbstractModel):
                 except Exception:
                     pass
             
+            # 🆕 ESEGUI TUTTE LE FUNZIONI (non solo la prima) per supporto multi-prodotto
             if function_calls:
-                function_name, parameters = function_calls[0]
+                _logger.info(f"📋 AI ha generato {len(function_calls)} chiamate funzione")
+                
+                # Caso speciale: se tutte sono search_products, accumula i risultati
+                if all(fn == 'search_products' for fn, _ in function_calls):
+                    _logger.info("🔍 Batch search_products rilevato - ricerca FUZZY multi-pattern")
+                    
+                    all_search_results = []
+                    search_mapping = []
+                    
+                    for idx, (fn, params) in enumerate(function_calls):
+                        search_term = params.get('search_term', '')
+                        _logger.info(f"  🔎 Search #{idx+1}: '{search_term}'")
+                        
+                        # 🆕 RICERCA DIRETTA (senza normalizzazione LLM per risparmiare token!)
+                        # La nuova logica fuzzy in search_products è già abbastanza intelligente
+                        result = ai_chatbot._execute_function(fn, params)
+                        
+                        if isinstance(result, list) and len(result) > 0:
+                            # Prendi il primo match (migliore ranking fuzzy)
+                            best_match = result[0]
+                            all_search_results.append(best_match)
+                            search_mapping.append({
+                                'query': search_term,
+                                'found': best_match['name'],
+                                'product_id': best_match['id'],
+                                'match_type': 'fuzzy'
+                            })
+                            _logger.info(f"  ✅ Match: '{search_term}' → {best_match['name']} (ID: {best_match['id']})")
+                        else:
+                            _logger.warning(f"  ❌ Nessun prodotto trovato per: '{search_term}'")
+                    
+                    _logger.info(f"📊 Batch completato: {len(all_search_results)}/{len(function_calls)} prodotti trovati")
+                    
+                    # Ora chiedi all'AI di generare update_sales_order con TUTTI i product_id trovati
+                    _logger.info(f"✅ Trovati {len(all_search_results)} prodotti totali - chiedo AI di generare update_sales_order")
+                    
+                    follow_up_messages = messages + [
+                        {'role': 'assistant', 'content': f"[Eseguito batch search]"},
+                        {'role': 'user', 'content': (
+                            f"✅ Risultati ricerca: {json.dumps(all_search_results)}\n\n"
+                            f"IMPORTANTE: Ora genera il tag update_sales_order usando questi product_id.\n"
+                            f"Esempio: [FUNCTION:update_sales_order|order_id:XXX|order_lines_updates:["
+                            f'{{\"product_id\":ID1,\"quantity\":QTY1}},{{\"product_id\":ID2,\"quantity\":QTY2}}]]\n\n'
+                            f"Richiesta originale utente: {user_message}"
+                        )}
+                    ]
+                    
+                    next_response = ai_chatbot._get_gemini_response(config, follow_up_messages)
+                    next_calls, _ = ai_chatbot._parse_ai_function_calls(next_response)
+                    
+                    if next_calls:
+                        function_name, parameters = next_calls[0]
+                        _logger.info(f"✅ AI ha generato: {function_name} con params: {parameters}")
+                    else:
+                        _logger.warning(f"⚠️ AI non ha generato update. Mostro risultati search")
+                        function_name = 'search_products'
+                        result = all_search_results
+                        parameters = {}
+                else:
+                    # Caso normale: esegui la prima funzione (comportamento legacy)
+                    function_name, parameters = function_calls[0]
+                
                 _logger.info(f"AI richiede funzione: {function_name} con params: {parameters}")
 
                 # Se l'utente ha espresso una data relativa (es. "tra 5 giorni"),
-                # calcola scheduled_date lato server usando AI normalizer.
+                # calcolo scheduled_date lato server usando AI normalizer.
                 exec_params = dict(parameters) if isinstance(parameters, dict) else {}
                 if function_name == 'create_sales_order':
                     dt = self._llm_when_to_datetime(user_message)
@@ -425,6 +641,41 @@ class MailBot(models.AbstractModel):
                         _logger.info(f"[WHEN] scheduled_date from LLM-normalized: {exec_params['scheduled_date']}")
 
                 result = ai_chatbot._execute_function(function_name, exec_params)
+                
+                # WORKFLOW MULTI-STEP: Se get_sales_order_details con internal=true, continua con prossima funzione
+                if function_name == 'get_sales_order_details' and isinstance(result, dict) and result.get('_internal_call'):
+                    _logger.info(f"✅ get_sales_order_details internal=true → continue workflow, ask AI for next call")
+                    
+                    # Chiedo all'AI di generare la prossima chiamata (update_sales_order) usando il risultato
+                    follow_up_messages = messages + [
+                        {'role': 'assistant', 'content': f"[FUNCTION:get_sales_order_details|order_name:{exec_params.get('order_name') or exec_params.get('order_id')}|internal:true]"},
+                        {'role': 'user', 'content': (
+                            f"✅ Risultato interno (NON mostrare all'utente): {json.dumps(result)}\n\n"
+                            f"IMPORTANTE: Ora genera IMMEDIATAMENTE il tag per update_sales_order usando i line_id dal risultato.\n"
+                            f"NON scrivere NULLA, SOLO il tag completo:\n"
+                            f"[FUNCTION:update_sales_order|order_name:XXX|order_lines_updates:[{{\"line_id\":ID,\"quantity\":QTY}}]]\n\n"
+                            f"Estrai i line_id dal risultato e genera il tag."
+                        )}
+                    ]
+                    
+                    next_response = ai_chatbot._get_gemini_response(config, follow_up_messages)
+                    next_calls, _ = ai_chatbot._parse_ai_function_calls(next_response)
+                    
+                    if next_calls:
+                        next_fn, next_params = next_calls[0]
+                        _logger.info(f"✅ Workflow continuato: {next_fn} con params: {next_params}")
+                        
+                        # Esegui la seconda funzione
+                        result = ai_chatbot._execute_function(next_fn, next_params)
+                        function_name = next_fn  # Aggiorna per la formattazione finale
+                        _logger.info(f"✅ Seconda funzione eseguita, risultato: {result}")
+                    else:
+                        _logger.warning(f"⚠️ AI non ha generato la seconda chiamata. Risposta: {next_response}")
+                        # Se l'AI ha comunque restituito un messaggio testuale (es. "ordine non trovato"),
+                        # mostralo all'utente invece del messaggio generico.
+                        if next_response:
+                            return format_html_response(next_response)
+                        return format_html_response("⚠️ Errore: impossibile completare la modifica. Riprova.")
                 
                 # ✅ Se create_sales_order richiede conferma, restituisci SOLO il messaggio formattato
                 if function_name == 'create_sales_order' and isinstance(result, dict) and result.get('requires_confirmation'):
@@ -499,51 +750,72 @@ class MailBot(models.AbstractModel):
                     return format_html_response("\n\n".join(lines))
                 
                 # Formattazione server-side per get_sales_order_details
+                _logger.warning(f"🔍 ENTRATO in formattazione get_sales_order_details - function_name={function_name}")
+                _logger.warning(f"🔍 isinstance(result, dict)={isinstance(result, dict)}, result.get('error')={result.get('error') if isinstance(result, dict) else 'N/A'}")
+                
                 if function_name == 'get_sales_order_details' and isinstance(result, dict) and not result.get('error'):
-                    lines = [f"📄 Dettagli Ordine: {result.get('order_name')}"]
-                    lines.append("")
-                    lines.append(f"👤 Cliente: {result.get('partner')}")
-                    if result.get('partner_email'):
-                        lines.append(f"📧 Email: {result.get('partner_email')}")
-                    if result.get('partner_phone'):
-                        lines.append(f"📞 Tel: {result.get('partner_phone')}")
-                    lines.append(f"📅 Data ordine: {result.get('date_order', 'N/A')}")
-                    lines.append(f"📊 Stato: {result.get('state_display', result.get('state'))}")
-                    lines.append(f"💰 Totale: {_fmt_price(result.get('amount_total', 0))}")
-                    
-                    # --- Delivery status robusto (nessuna KeyError) ---
-                    status = result.get('delivery_status') or result.get('delivery_status_computed')
-                    if status:
-                        labels = {
-                            'nothing_to_deliver': 'Nulla da consegnare',
-                            'not_delivered': 'Non consegnato',
-                            'partially_delivered': 'Parzialmente consegnato',
-                            'fully_delivered': 'Consegnato',
-                        }
-                        lines.append(f"🚚 Consegna: {labels.get(status, status)}")
-                    
-                    lines.append("")
-                    
-                    # Righe ordine
-                    order_lines = result.get('order_lines', [])
-                    if order_lines:
-                        lines.append(f"📦 Prodotti ({len(order_lines)}):")
+                    _logger.warning(f"🔍 DENTRO blocco formattazione get_sales_order_details")
+                    # Usa la funzione centralizzata per garantire dati freschi dal DB
+                    try:
+                        order_id = result.get('order_id')
+                        order_name = result.get('order_name')
+                        
+                        _logger.warning(f"🔍 DEBUG: order_id={order_id}, order_name={order_name}")
+                        _logger.warning(f"🔍 DEBUG: result completo={result}")
+                        
+                        SaleOrder = self.env['sale.order']
+                        order = SaleOrder.browse(order_id) if order_id else SaleOrder.search([('name', '=', order_name)], limit=1)
+                        
+                        _logger.warning(f"🔍 DEBUG: order trovato={order}, exists={order.exists() if order else False}")
+                        
+                        if order and order.exists():
+                            # Usa _build_sales_order_summary per riepilogo fresco
+                            summary = self._build_sales_order_summary(order)
+                            
+                            # Aggiungi info extra (email, telefono, delivery status)
+                            extra_info = []
+                            
+                            if result.get('partner_email'):
+                                extra_info.append(f"� Email: {result.get('partner_email')}")
+                            if result.get('partner_phone'):
+                                extra_info.append(f"� Tel: {result.get('partner_phone')}")
+                            
+                            status = result.get('delivery_status') or result.get('delivery_status_computed')
+                            if status:
+                                labels = {
+                                    'nothing_to_deliver': 'Nulla da consegnare',
+                                    'not_delivered': 'Non consegnato',
+                                    'partially_delivered': 'Parzialmente consegnato',
+                                    'fully_delivered': 'Consegnato',
+                                }
+                                extra_info.append(f"🚚 Consegna: {labels.get(status, status)}")
+                            
+                            # Delivery collegati
+                            pickings = result.get('pickings', [])
+                            if pickings:
+                                extra_info.append("")
+                                extra_info.append(f"🚚 Consegne ({len(pickings)}):")
+                                for p in pickings:
+                                    extra_info.append(f"  • {p.get('picking_name')} - Stato: {p.get('state_display', p.get('state'))}")
+                            
+                            # Componi risposta finale
+                            if extra_info:
+                                final_text = summary + "\n\n" + "\n".join(extra_info)
+                            else:
+                                final_text = summary
+                            
+                            return format_html_response(final_text)
+                        else:
+                            return format_html_response(f"⚠️ Ordine {order_name or order_id} non trovato")
+                    except Exception as e:
+                        _logger.error(f"Errore formattando get_sales_order_details: {e}", exc_info=True)
+                        # Fallback al vecchio formato se c'è errore
+                        lines = [f"📄 Dettagli Ordine: {result.get('order_name')}"]
                         lines.append("")
-                        for line in order_lines:
-                            qty = line.get('quantity', 0)
-                            price = _fmt_price(line.get('price_unit', 0))
-                            subtotal = _fmt_price(line.get('subtotal', 0))
-                            lines.append(f"• {line.get('product')} - Qtà: {int(qty)} - Prezzo: {price} - Subtotale: {subtotal}")
-                    
-                    # Delivery collegati
-                    pickings = result.get('pickings', [])
-                    if pickings:
-                        lines.append("")
-                        lines.append(f"🚚 Consegne ({len(pickings)}):")
-                        for p in pickings:
-                            lines.append(f"  • {p.get('picking_name')} - Stato: {p.get('state_display', p.get('state'))}")
-                    
-                    return format_html_response("\n\n".join(lines))
+                        lines.append(f"👤 Cliente: {result.get('partner')}")
+                        lines.append(f"📊 Stato: {result.get('state_display', result.get('state'))}")
+                        lines.append(f"💰 Totale: €{result.get('amount_total', 0):.2f}")
+                        return format_html_response("\n\n".join(lines))
                 
                 # Formattazione server-side per get_top_customers
                 if function_name == 'get_top_customers' and isinstance(result, dict):
@@ -607,38 +879,95 @@ class MailBot(models.AbstractModel):
                         if function_name == 'create_sales_order':
                             order_name = result.get('sale_order_name') or result.get('order_name') or result.get('name') or result.get('display_name')
                             order_id = result.get('sale_order_id') or result.get('order_id') or result.get('id')
+                            
                             if order_name:
                                 lines.append(f"✅ Ordine creato: {order_name}")
                             if order_id:
                                 lines.append(f"ID interno: {order_id}")
-                            pickings = result.get('pickings') or result.get('picking') or result.get('picking_ids') or result.get('picking_id')
-                            if pickings:
-                                try:
-                                    lines.append("Consegne generate:")
-                                    lines.append(json.dumps(pickings, indent=2))
-                                except Exception:
-                                    lines.append(str(pickings))
+                            
+                            # Allego riepilogo fresco dal DB invece di JSON generico
                             try:
-                                lines.append("Dettagli ordine:")
-                                lines.append(json.dumps(result, indent=2))
-                            except Exception:
-                                pass
+                                SaleOrder = self.env['sale.order']
+                                order = SaleOrder.browse(order_id) if order_id else SaleOrder.search([('name', '=', order_name)], limit=1)
+                                
+                                if order and order.exists():
+                                    lines.append("")
+                                    lines.append("━━━━━━━━━━━━━━━━━━━━")
+                                    summary = self._build_sales_order_summary(order)
+                                    lines.append(summary)
+                                    
+                                    # Aggiungi info pickings se presenti
+                                    pickings = result.get('pickings') or result.get('picking') or result.get('picking_ids') or result.get('picking_id')
+                                    if pickings:
+                                        lines.append("")
+                                        lines.append("🚚 Consegne generate:")
+                                        if isinstance(pickings, list):
+                                            for p in pickings:
+                                                if isinstance(p, dict):
+                                                    lines.append(f"  • {p.get('name', 'N/A')} - Stato: {p.get('state', 'N/A')}")
+                                                else:
+                                                    lines.append(f"  • {p}")
+                                        else:
+                                            lines.append(f"  • {pickings}")
+                                else:
+                                    # Fallback se ordine non trovato
+                                    lines.append("")
+                                    lines.append("Dettagli ordine:")
+                                    lines.append(json.dumps(result, indent=2))
+                            except Exception as e:
+                                _logger.error(f"Errore generando riepilogo create_sales_order: {e}", exc_info=True)
+                                # Fallback al vecchio formato
+                                pickings = result.get('pickings') or result.get('picking') or result.get('picking_ids') or result.get('picking_id')
+                                if pickings:
+                                    try:
+                                        lines.append("Consegne generate:")
+                                        lines.append(json.dumps(pickings, indent=2))
+                                    except Exception:
+                                        lines.append(str(pickings))
+                                try:
+                                    lines.append("Dettagli ordine:")
+                                    lines.append(json.dumps(result, indent=2))
+                                except Exception:
+                                    pass
                         elif function_name == 'update_sales_order':
                             order_name = result.get('order_name')
+                            order_id = result.get('order_id')
+                            
                             if order_name:
                                 lines.append(f"✅ Ordine {order_name} aggiornato")
+                            
+                            # Mostra modifiche effettuate
                             if result.get('updated_lines'):
+                                lines.append("")
                                 lines.append("Righe modificate:")
                                 for upd in result['updated_lines']:
                                     lines.append(f"  • {upd['product']}: {upd['old_quantity']} → {upd['new_quantity']}")
                             if result.get('added_lines'):
+                                lines.append("")
                                 lines.append("Righe aggiunte:")
                                 for add in result['added_lines']:
                                     lines.append(f"  • {add['product']}: {add['quantity']} pz")
                             if result.get('deleted_lines'):
+                                lines.append("")
                                 lines.append(f"Righe eliminate: {', '.join(result['deleted_lines'])}")
-                            if result.get('amount_total'):
-                                lines.append(f"Totale ordine: €{result['amount_total']}")
+                            
+                            # Allego SEMPRE Riepilogo aggiornato dal DB (NON riuso testo vecchio)
+                            try:
+                                SaleOrder = self.env['sale.order']
+                                order = SaleOrder.browse(order_id) if order_id else SaleOrder.search([('name', '=', order_name)], limit=1)
+                                
+                                if order and order.exists():
+                                    lines.append("")
+                                    lines.append("━━━━━━━━━━━━━━━━━━━━")
+                                    summary = self._build_sales_order_summary(order)
+                                    lines.append(summary)
+                                else:
+                                    lines.append("")
+                                    lines.append("⚠️ Impossibile generare riepilogo aggiornato (ordine non trovato)")
+                            except Exception as e:
+                                _logger.error(f"Errore generando riepilogo aggiornato: {e}", exc_info=True)
+                                lines.append("")
+                                lines.append(f"⚠️ Errore generando riepilogo: {e}")
                         elif function_name == 'update_delivery':
                             picking_name = result.get('picking_name')
                             if picking_name:
@@ -821,25 +1150,72 @@ class MailBot(models.AbstractModel):
     
     def _is_cancellation(self, user_message):
         """
-        Usa l'LLM per capire se l'utente vuole annullare l'ordine.
-        Restituisce True solo se c'è una CHIARA intenzione di annullamento.
+        Determina se l'utente vuole ANNULLARE l'OPERAZIONE PENDENTE (gate di conferma),
+        non un documento esistente (es. "annulla ordine SO123", "cancella ordine").
+        
+        Logica:
+        1. Se il messaggio contiene riferimenti a documenti (ordine, preventivo, consegna, fattura)
+           O codici tipo SO123, WH/OUT/00001 → NON è cancellazione del gate (return False)
+        2. Altrimenti usa l'LLM per distinguere tra "annulla operazione pendente" vs "modifica/continua"
+        
+        Esempi che NON devono cancellare il gate:
+        - "annulla ordine" / "cancella ordine" → False (parla di un ordine, non del gate)
+        - "annulla consegna WH/OUT/00012" → False (specifica un documento)
+        - "elimina preventivo" → False (parla di un preventivo)
+        
+        Esempi che DEVONO cancellare il gate:
+        - "no grazie" / "annulla" / "annulla tutto" → True (vuole fermare l'operazione)
+        - "non procedere" / "ferma" → True
         """
+        text_lower = (user_message or '').strip().lower()
+        
+        # STEP 1: Pre-filter - Se il messaggio parla di documenti o contiene codici, NON è cancellazione del gate
+        # Rileva codici documento (SO123, WH/OUT/00001, INV/2024/00123, ecc.)
+        if re.search(r'\b(SO\d+|WH/(?:OUT|IN)/\d+|INV/\d+/\d+|PO\d+)\b', user_message or '', re.I):
+            _logger.info(f"🔍 Pre-filter: messaggio contiene codice documento → NON cancello gate: '{user_message[:50]}'")
+            return False
+        
+        # Rileva parole che indicano documenti di business (ordine, preventivo, consegna, fattura, ecc.)
+        business_keywords = [
+            'ordine', 'ordini',
+            'preventivo', 'preventivi', 'quotazione', 'quotazioni',
+            'consegna', 'consegne', 'delivery', 'spedizione', 'spedizioni',
+            'fattura', 'fatture', 'invoice',
+            'documento', 'documenti',
+            'picking', 'transfer'
+        ]
+        
+        # Se trova keyword business, verifica che non stia parlando di "questa operazione"/"questo"
+        if any(kw in text_lower for kw in business_keywords):
+            # Eccezioni: se dice esplicitamente "questa operazione"/"questo", potrebbe voler cancellare il gate
+            if not re.search(r'\b(quest[aeo]|questo|questa)\s+(operazione|processo|procedura)\b', text_lower):
+                _logger.info(f"🔍 Pre-filter: messaggio parla di documenti business → NON cancello gate: '{user_message[:50]}'")
+                return False
+        
+        # STEP 2: Usa LLM per classificare se vuole annullare IL GATE (operazione pendente)
         try:
             ai_chatbot = self.env['discuss.channel']
             config = self.env['ai.config'].get_active_config()
             
             prompt = (
-                "Sei un classificatore di intenti. "
-                "L'utente ha un ordine in sospeso che deve confermare. "
+                "Sei un classificatore di intenti per un flusso di conferma.\n"
+                "C'è un'OPERAZIONE PENDENTE (es. creazione preventivo) che attende conferma dell'utente.\n"
                 "Analizza questo messaggio e rispondi SOLO con 'YES' o 'NO'.\n\n"
-                "Rispondi 'YES' se l'utente vuole CHIARAMENTE annullare/cancellare l'ordine.\n"
-                "Rispondi 'NO' se l'utente vuole modificare, cambiare data, o continua la conversazione.\n\n"
-                "Esempi:\n"
-                "- 'no grazie' → YES\n"
-                "- 'annulla tutto' → YES\n"
-                "- 'no, aspetta' → YES\n"
+                "Rispondi 'YES' se l'utente vuole CHIARAMENTE annullare/fermare QUESTA OPERAZIONE PENDENTE "
+                "(es. 'no grazie', 'annulla', 'annulla tutto', 'non procedere', 'ferma', 'stop').\n\n"
+                "Rispondi 'NO' se l'utente:\n"
+                "- Vuole modificare dati/date (es. 'cambia la data', 'voglio il 30')\n"
+                "- Sta chiedendo azioni su documenti ESISTENTI (es. 'annulla ordine', 'cancella ordine', 'annulla consegna')\n"
+                "- Continua la conversazione normalmente\n\n"
+                "ESEMPI CHIAVE:\n"
+                "- 'no grazie' → YES (annulla operazione pendente)\n"
+                "- 'annulla tutto' → YES (annulla operazione)\n"
+                "- 'non procedere' / 'ferma' / 'stop' → YES (annulla operazione)\n"
+                "- 'annulla ordine' → NO (vuole annullare un ordine, non il gate)\n"
+                "- 'cancella ordine' → NO (vuole cancellare un ordine, non il gate)\n"
+                "- 'elimina preventivo' → NO (parla di un documento)\n"
+                "- 'annulla consegna WH/OUT/00012' → NO (specifica documento)\n"
                 "- 'no scherzo, voglio il 30' → NO (vuole modificare)\n"
-                "- 'no, lo voglio tra 5 giorni' → NO (vuole modificare)\n"
                 "- 'cambia la data' → NO (vuole modificare)\n\n"
                 f"MESSAGGIO UTENTE: {user_message}\n\n"
                 "RISPONDI SOLO: YES o NO"
@@ -849,12 +1225,15 @@ class MailBot(models.AbstractModel):
             response_clean = (response or '').strip().upper()
             
             is_cancel = 'YES' in response_clean
-            _logger.info(f"🤖 LLM cancellation check: '{user_message[:50]}' → {response_clean} → {'CANCEL' if is_cancel else 'KEEP'}")
+            _logger.info(
+                f"🤖 LLM gate-cancel check: '{user_message[:50]}' → {response_clean} → "
+                f"{'CANCEL_GATE' if is_cancel else 'KEEP_GATE'}"
+            )
             
             return is_cancel
             
         except Exception as e:
-            _logger.error(f"Errore LLM cancellation check: {e}", exc_info=True)
+            _logger.error(f"Errore LLM gate-cancel check: {e}", exc_info=True)
             # Fallback sicuro: NON annullare in caso di errore
             return False
     
@@ -962,6 +1341,19 @@ class MailBot(models.AbstractModel):
                 
                 # Salta messaggi di sistema (marker reset, notifiche)
                 if '[SYSTEM_RESET]' in body_text or msg.message_type == 'notification':
+                    continue
+                
+                # 🆕 FILTRA MESSAGGI DI ERRORE - Non includere nello storico per evitare che l'AI impari a rispondere con errori
+                if any(keyword in body_text.lower() for keyword in [
+                    'errore di connessione',
+                    '503 server error',
+                    '503 service unavailable',
+                    'service unavailable',
+                    'connection error',
+                    'timeout error',
+                    'api error',
+                ]):
+                    _logger.info(f"⚠️ Filtrato messaggio di errore dallo storico: {body_text[:50]}...")
                     continue
                 
                 if not body_text or len(body_text) < 2:
