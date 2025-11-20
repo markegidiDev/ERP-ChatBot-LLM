@@ -248,8 +248,9 @@ Poi aggiorna il system prompt in `ai_config` per informare l'LLM della nuova fun
 ### Modificare Logica Chat
 
 La logica principale è in `ai_chatbot.py`:
-- `_call_llm_with_tools()`: Orchestrazione chiamata LLM con tool execution
+- `_call_gemini()` / `_call_openrouter()`: Orchestrazione chiamate LLM con tool execution
 - `_normalize_product_search_term()`: Normalizzazione termini ricerca
+- `_execute_function()`: Esecuzione delle funzioni chiamate dall'LLM
 - `format_html_response()`: Formattazione output HTML per chat
 
 ### Testing
