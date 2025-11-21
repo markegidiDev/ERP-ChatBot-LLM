@@ -129,7 +129,7 @@ ai_livebot/
 ```
 Provider: gemini
 API Key: YOUR_GEMINI_API_KEY
-Model: gemini-2.0-flash-exp (o altro modello)
+Model: gemini-2.5-flash (o altro modello)
 Temperature: 0.7 (0.0-1.0)
 Max Tokens: 1500
 ```
@@ -140,7 +140,7 @@ Ottieni la chiave API: [Google AI Studio](https://aistudio.google.com/app/apikey
 ```
 Provider: openrouter
 API Key: YOUR_OPENROUTER_API_KEY
-Model: google/gemini-2.0-flash-exp:free (o altro)
+Model: google/gemini-2.5-flash:free (o altro)
 Temperature: 0.7
 Max Tokens: 1500
 ```

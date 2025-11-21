@@ -204,6 +204,47 @@ class MailBot(models.AbstractModel):
             _logger.warning(f"LLM when normalize failed: {e}", exc_info=True)
         return None
 
+    def _wants_full_catalog(self, user_message):
+        """
+        Usa l'LLM per capire se l'utente sta chiedendo esplicitamente
+        il catalogo completo (senza filtri).
+        """
+        try:
+            ai_chatbot = self.env['discuss.channel']
+            config = self.env['ai.config'].get_active_config()
+
+            prompt = (
+                "Sei un classificatore YES/NO.\n"
+                "Rispondi SOLO con YES o NO.\n\n"
+                "YES se il messaggio chiede di vedere TUTTI i prodotti o il catalogo completo "
+                "(es: 'mostra tutto il catalogo', 'lista completa dei prodotti', 'cosa abbiamo a magazzino').\n"
+                "NO se chiede o suggerisce un prodotto specifico o una ricerca filtrata.\n\n"
+                f"Messaggio: {user_message}\n\n"
+                "Rispondi YES o NO, nulla altro."
+            )
+
+            resp = ai_chatbot._get_gemini_response(config, [{'role': 'user', 'content': prompt}])
+            return 'YES' in (resp or '').strip().upper()
+        except Exception as e:
+            _logger.warning(f"Errore wants_full_catalog: {e}", exc_info=True)
+            return False
+
+    def _prepare_search_params(self, params, user_message):
+        """
+        Evita di restituire il catalogo completo quando l'AI omette search_term.
+        Se non �� una richiesta esplicita di 'mostra tutto', forza search_term dal testo utente.
+        """
+        if params.get('search_term') or params.get('product_type'):
+            return params
+
+        if self._wants_full_catalog(user_message):
+            return params
+
+        ai_chatbot = self.env['discuss.channel']
+        fixed = dict(params)
+        fixed['search_term'] = ai_chatbot._normalize_product_search_term(user_message) or user_message
+        return fixed
+
     @api.model
     def _apply_logic(self, record, values, command=False):
         """
@@ -362,13 +403,16 @@ class MailBot(models.AbstractModel):
         try:
             config = self.env['ai.config'].get_active_config()
             
+            # Flag per rilevare intento di cancellazione, evita bypass/riepiloghi automatici
+            cancel_intent = bool(re.search(r'\b(annulla|cancella|elimina|delete)\b', user_message, re.I))
+            
             # STEP 0: INTERCETTA RICHIESTE DI RIEPILOGO ORDINE (bypass AI)
             # Pattern: "riepilogo S00064", "dettagli ordine 62", "S00064", "ordine SO123"
             order_pattern = r'\b(?:riepilogo|dettagli?|info|mostra|vedi|dammi)\s*(?:ordine|preventivo|SO)?\s*[:\s]?\s*([Ss]0*\d+|SO\d+|ordine\s+\d+)'
             simple_code = r'^[Ss]0*\d+$|^SO\d+$'
             
             match = re.search(order_pattern, user_message, re.I)
-            if match or re.match(simple_code, user_message.strip()):
+            if (match or re.match(simple_code, user_message.strip())) and not cancel_intent:
                 # Estrai il codice ordine
                 if match:
                     code_raw = match.group(1)
@@ -505,6 +549,32 @@ class MailBot(models.AbstractModel):
                 
                 return format_html_response("\n\n".join(lines) if lines else "Operazione completata.")
             
+            # STEP 1.5: Check for pending cancel confirmation
+            pending_cancel_json = self._check_pending_cancel(channel, user_message)
+            if pending_cancel_json:
+                _logger.info(f"Utente ha confermato cancellazione pendente: {pending_cancel_json}")
+                
+                warehouse_ops = self.env['warehouse.operations']
+                result = warehouse_ops.cancel_sales_order(**pending_cancel_json)
+                
+                lines = []
+                if isinstance(result, dict) and result.get('error'):
+                    lines.append(f"⚠️ Errore: {result.get('error')}")
+                    if result.get('details'):
+                        lines.append(result.get('details'))
+                else:
+                    order_name = result.get('order_name') or pending_cancel_json.get('order_name')
+                    order_id = result.get('order_id') or pending_cancel_json.get('order_id')
+                    if order_name:
+                        lines.append(f"✅ Ordine cancellato: {order_name}")
+                    if order_id:
+                        lines.append(f"ID interno: {order_id}")
+                    
+                    current_state = result.get('current_state', 'cancel')
+                    lines.append(f"Stato finale: {current_state}")
+                
+                return format_html_response("\n\n".join(lines) if lines else "Operazione completata.")
+            
             # STEP 2: Check if user cancelled pending order
             if self._is_cancellation(user_message) and self._has_pending_marker(channel):
                 return format_html_response("❌ Operazione annullata: non procedo con la creazione del preventivo.")
@@ -577,6 +647,7 @@ class MailBot(models.AbstractModel):
                     search_mapping = []
                     
                     for idx, (fn, params) in enumerate(function_calls):
+                        params = self._prepare_search_params(params, user_message)
                         search_term = params.get('search_term', '')
                         _logger.info(f"  🔎 Search #{idx+1}: '{search_term}'")
                         
@@ -617,6 +688,11 @@ class MailBot(models.AbstractModel):
                     next_response = ai_chatbot._get_gemini_response(config, follow_up_messages)
                     next_calls, _ = ai_chatbot._parse_ai_function_calls(next_response)
                     
+                    # ⚠️ Se l'AI ha generato PENDING_SO invece di update_sales_order, restituisci direttamente!
+                    if '[PENDING_SO]' in next_response or '[PENDING_CANCEL]' in next_response:
+                        _logger.info("✅ AI ha generato PENDING marker dopo batch search - restituisco direttamente")
+                        return format_html_response(next_response)
+                    
                     if next_calls:
                         function_name, parameters = next_calls[0]
                         _logger.info(f"✅ AI ha generato: {function_name} con params: {parameters}")
@@ -634,6 +710,9 @@ class MailBot(models.AbstractModel):
                 # Se l'utente ha espresso una data relativa (es. "tra 5 giorni"),
                 # calcolo scheduled_date lato server usando AI normalizer.
                 exec_params = dict(parameters) if isinstance(parameters, dict) else {}
+                if function_name == 'search_products':
+                    exec_params = self._prepare_search_params(exec_params, user_message)
+
                 if function_name == 'create_sales_order':
                     dt = self._llm_when_to_datetime(user_message)
                     if dt:
@@ -700,7 +779,10 @@ class MailBot(models.AbstractModel):
                     _logger.info("✅ Richiesta conferma - restituisco SOLO il campo 'message'")
                     return format_html_response(result.get('message', 'Confermi?'))
 
-
+                # ✅ Se cancel_sales_order richiede conferma, restituisci SOLO il messaggio formattato
+                if function_name == 'cancel_sales_order' and isinstance(result, dict) and result.get('requires_confirmation'):
+                    _logger.info("✅ Richiesta conferma cancellazione - restituisco SOLO il campo 'message'")
+                    return format_html_response(result.get('message'))
 
                 # Helper per formattare prezzi
                 def _fmt_price(val):
@@ -753,7 +835,7 @@ class MailBot(models.AbstractModel):
                 _logger.warning(f"🔍 ENTRATO in formattazione get_sales_order_details - function_name={function_name}")
                 _logger.warning(f"🔍 isinstance(result, dict)={isinstance(result, dict)}, result.get('error')={result.get('error') if isinstance(result, dict) else 'N/A'}")
                 
-                if function_name == 'get_sales_order_details' and isinstance(result, dict) and not result.get('error'):
+                if function_name == 'get_sales_order_details' and isinstance(result, dict) and not result.get('error') and not cancel_intent:
                     _logger.warning(f"🔍 DENTRO blocco formattazione get_sales_order_details")
                     # Usa la funzione centralizzata per garantire dati freschi dal DB
                     try:
@@ -849,7 +931,7 @@ class MailBot(models.AbstractModel):
                     return format_html_response("\n\n".join(lines))
 
                 # Se è una funzione mutante, compone una risposta diretta senza chiedere all'AI
-                mutating_fns = {'create_sales_order', 'create_partner', 'create_delivery_order', 'validate_delivery', 'update_sales_order', 'update_delivery', 'process_delivery_decision'}
+                mutating_fns = {'create_sales_order', 'create_partner', 'create_delivery_order', 'validate_delivery', 'update_sales_order', 'update_delivery', 'process_delivery_decision', 'cancel_sales_order'}
                 
                 # Gestione speciale per validate_delivery che richiede decisione
                 if function_name == 'validate_delivery' and isinstance(result, dict) and result.get('requires_decision'):
@@ -1002,9 +1084,23 @@ class MailBot(models.AbstractModel):
                     return format_html_response(final_response)
 
                 # Altrimenti (funzioni di sola lettura), chiedi all'AI di formattare la risposta
+                # ⚠️ IMPORTANTE: Se la risposta contiene già PENDING_SO o PENDING_CANCEL, NON fare follow-up!
+                # Il marker è la risposta finale, il controller gestirà la conferma
+                if '[PENDING_SO]' in ai_response or '[PENDING_CANCEL]' in ai_response:
+                    _logger.info("✅ Risposta contiene PENDING marker - restituisco direttamente senza follow-up")
+                    return format_html_response(ai_response)
+                
+                # ⚠️ Se non ci sono function_calls, significa che l'AI ha già generato la risposta finale
+                # Questo succede dopo batch search quando l'AI genera PENDING_SO invece di update_sales_order
+                if not function_calls or len(function_calls) == 0:
+                    _logger.info("✅ Nessuna function call trovata - risposta finale dell'AI")
+                    return format_html_response(ai_response)
+                
                 # Se abbiamo appena eseguito search_products, l'utente probabilmente vuole creare un ordine
                 # Quindi chiediamo esplicitamente all'AI di generare create_sales_order
-                if function_name == 'search_products' and isinstance(result, list) and len(result) > 0:
+                # MA: se non ci sono function_calls E la risposta è già completa (no search_products risultati),
+                # significa che l'AI ha già generato PENDING_SO, quindi NON fare follow-up
+                if function_name == 'search_products' and isinstance(result, list) and len(result) > 0 and len(function_calls) > 0:
                     # Estrai il product_id dal primo risultato
                     product_info = result[0]
                     follow_up_messages = messages + [
@@ -1145,6 +1241,70 @@ class MailBot(models.AbstractModel):
                 _logger.warning("❌ No last bot message found")
         except Exception as e:
             _logger.error(f"❌ Errore checking pending SO: {e}", exc_info=True)
+        
+        return None
+    
+    def _check_pending_cancel(self, channel, user_message):
+        """
+        Controlla se c'è una cancellazione pendente e se l'utente ha confermato.
+        Restituisce il JSON dei parametri se confermato, altrimenti None.
+        """
+        _logger.info(f"🔍 Checking cancel confirmation for message: {user_message}")
+        if not re.search(r'\b(S[IÌI]|CONFERMO|OK\s*VAI|PERFETTO)\b', user_message, re.I):
+            _logger.info("❌ No confirmation keyword found")
+            return None
+        
+        _logger.info("✅ Confirmation keyword detected!")
+        
+        try:
+            from odoo.addons.ai_livebot.models.ai_chatbot import PENDING_CANCEL_MARKER
+            
+            bot_partner_ids = {
+                partner.id
+                for partner in (
+                    self.env.ref('base.partner_odoobot', raise_if_not_found=False),
+                    self.env.ref('base.partner_root', raise_if_not_found=False),
+                )
+                if partner
+            }
+            
+            last_bot_msg = self.env['mail.message'].search([
+                ('model', '=', channel._name),
+                ('res_id', '=', channel.id),
+                ('author_id', 'in', list(bot_partner_ids)),
+                ('message_type', '=', 'comment'),
+            ], order='date desc', limit=1)
+            
+            if last_bot_msg and last_bot_msg.body:
+                body_text = re.sub(r'<[^>]+>', '', last_bot_msg.body or '').strip()
+                _logger.info(f"📄 Last bot message (first 200 chars): {body_text[:200]}")
+                
+                text = body_text
+                idx = text.find(PENDING_CANCEL_MARKER)
+                if idx != -1:
+                    jstart = text.find('{', idx)
+                    if jstart != -1:
+                        depth = 0
+                        end = None
+                        for k, ch in enumerate(text[jstart:], start=jstart):
+                            if ch == '{':
+                                depth += 1
+                            elif ch == '}':
+                                depth -= 1
+                                if depth == 0:
+                                    end = k + 1
+                                    break
+                        if end:
+                            json_str = text[jstart:end]
+                            _logger.info(f"✅ Found PENDING_CANCEL marker with JSON: {json_str}")
+                            parsed = json.loads(json_str)
+                            _logger.info(f"✅ Parsed cancel params: {parsed}")
+                            return parsed
+                _logger.warning(f"❌ Marker {PENDING_CANCEL_MARKER} not found or JSON not balanced")
+            else:
+                _logger.warning("❌ No last bot message found")
+        except Exception as e:
+            _logger.error(f"❌ Errore checking pending cancel: {e}", exc_info=True)
         
         return None
     

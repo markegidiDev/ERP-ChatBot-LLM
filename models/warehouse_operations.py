@@ -898,6 +898,9 @@ class WarehouseOperations(models.AbstractModel):
         
         if not order_lines_updates and not scheduled_date:
             return {"error": "Nessuna modifica specificata in order_lines_updates o scheduled_date"}
+
+        # Permetti aggiornamento solo data senza righe
+        order_lines_updates = order_lines_updates or []
         
         # Gestisci scheduled_date se fornita
         if scheduled_date:

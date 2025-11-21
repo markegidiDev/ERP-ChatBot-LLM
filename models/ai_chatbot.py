@@ -9,6 +9,8 @@ _logger = logging.getLogger(__name__)
 
 # Marker for pending sales order confirmation
 PENDING_SO_MARKER = "[PENDING_SO]"
+# Marker per conferma cancellazione ordine
+PENDING_CANCEL_MARKER = "[PENDING_CANCEL]"
 
 
 def _balanced_json_extract_simple(txt):
@@ -820,7 +822,35 @@ class DiscussChannel(models.Model):
                         call_params['order_id'] = int(call_params['order_id'])
                     except (TypeError, ValueError):
                         return {"error": "order_id deve essere un numero"}
-                
+
+                # Gestione conferma: se non esplicitamente confermato, richiedi conferma all'utente
+                confirm_flag = call_params.pop('confirm', False)
+                if isinstance(confirm_flag, str):
+                    confirm_flag = confirm_flag.lower() in ('true', '1', 'yes', 'si', 'sì', 's')
+
+                if not confirm_flag:
+                    # Non eseguire la cancellazione: chiedi conferma usando un marker JSON
+                    try:
+                        params_for_marker = {}
+                        # Mantieni solo order_name/order_id per il marker
+                        if 'order_id' in call_params:
+                            params_for_marker['order_id'] = call_params['order_id']
+                        if 'order_name' in call_params:
+                            params_for_marker['order_name'] = call_params['order_name']
+
+                        marker_json = json.dumps(params_for_marker)
+                        message = (
+                            f"⚠️ Stai per cancellare l'ordine {params_for_marker.get('order_name', params_for_marker.get('order_id', ''))}. "
+                            "Questa operazione è distruttiva e non può essere annullata.\n\n"
+                            "Confermi la cancellazione? (rispondi SÌ/CONFERMO per procedere)\n\n"
+                            f"{PENDING_CANCEL_MARKER} {marker_json}"
+                        )
+                        return {"requires_confirmation": True, "message": message}
+                    except Exception:
+                        # In caso di problema con il marker, fall back alla cancellazione diretta
+                        _logger.exception("Errore creando marker conferma cancellazione - procedo con cancellazione diretta")
+
+                # Confermato: esegui la cancellazione
                 return warehouse_ops.cancel_sales_order(**call_params)
             
             elif function_name == 'update_delivery':
@@ -1023,6 +1053,9 @@ class DiscussChannel(models.Model):
             # controllo se ci sono ordini di vendita in attesa prima di chiamare l'ai
             user_message = re.sub(r'<[^>]+>', '', body or '').strip()
 
+            # Flag per tracciare se abbiamo gestito una conferma (evita di chiamare l'AI dopo)
+            confirmation_handled = False
+
             if re.search(r'\b(S[IÌI]|CONFERMO|OK\s*VAI|PERFETTO)\b', user_message, re.I):
                 _logger.info("Possibile conferma rilevata, verifico marker [PENDING_SO]")
 
@@ -1113,16 +1146,92 @@ class DiscussChannel(models.Model):
                                             author_id=last_bot_msg.author_id.id if last_bot_msg else bot_partner_ids[0],
                                         )
 
+                                        confirmation_handled = True
                                         return result
                                     except Exception as e:
                                         _logger.error(f"Errore durante l'esecuzione diretta di create_sales_order: {e}", exc_info=True)
                         else:
                             _logger.info("Nessun marker [PENDING_SO] trovato nell'ultimo messaggio del bot")
+
+                # --- Gestione conferma cancellazione (PENDING_CANCEL) ---
+                if re.search(r'\b(S[IÌI]|CONFERMO|OK\s*VAI|PERFETTO)\b', user_message, re.I):
+                    _logger.info("Possibile conferma rilevata, verifico marker [PENDING_CANCEL]")
+
+                    bot_partner_ids = []
+                    for xmlid in ('base.partner_root', 'base.partner_odoobot'):
+                        partner = self.env.ref(xmlid, raise_if_not_found=False)
+                        if partner:
+                            bot_partner_ids.append(partner.id)
+
+                    if bot_partner_ids:
+                        last_bot_msg = self.env['mail.message'].search([
+                            ('model', '=', self._name),
+                            ('res_id', '=', self.id),
+                            ('author_id', 'in', bot_partner_ids),
+                            ('message_type', '=', 'comment'),
+                        ], order='date desc', limit=1)
+
+                        if last_bot_msg and last_bot_msg.body:
+                            msg_text = re.sub(r'<[^>]+>', '', last_bot_msg.body or '').strip()
+                            _logger.debug(f"Ultimo messaggio bot (200 char): {msg_text[:200]}")
+
+                            # Cerca marker PENDING_CANCEL
+                            text = msg_text
+                            idx = text.find(PENDING_CANCEL_MARKER)
+                            if idx != -1:
+                                jstart = text.find('{', idx)
+                                if jstart != -1:
+                                    depth = 0
+                                    end = None
+                                    for k, ch in enumerate(text[jstart:], start=jstart):
+                                        if ch == '{':
+                                            depth += 1
+                                        elif ch == '}':
+                                            depth -= 1
+                                            if depth == 0:
+                                                end = k + 1
+                                                break
+                                    if end:
+                                        json_str = text[jstart:end]
+                                        _logger.info("Marker [PENDING_CANCEL] trovato: eseguo cancel_sales_order senza AI")
+                                        try:
+                                            params = json.loads(json_str)
+
+                                            warehouse_ops = self.env['warehouse.operations']
+                                            result_cancel = warehouse_ops.cancel_sales_order(**params)
+
+                                            lines = []
+                                            if isinstance(result_cancel, dict) and result_cancel.get('error'):
+                                                lines.append(f"⚠️ Errore: {result_cancel.get('error')}")
+                                                if result_cancel.get('details'):
+                                                    lines.append(result_cancel['details'])
+                                            else:
+                                                order_name = result_cancel.get('order_name') or params.get('order_name')
+                                                order_id = result_cancel.get('order_id') or params.get('order_id')
+                                                if order_name:
+                                                    lines.append(f"✅ Ordine cancellato: {order_name}")
+                                                if order_id:
+                                                    lines.append(f"ID interno: {order_id}")
+
+                                            self.message_post(
+                                                body=format_html_response("\n\n".join(lines) if lines else "Operazione completata."),
+                                                message_type='comment',
+                                                subtype_xmlid='mail.mt_comment',
+                                                author_id=last_bot_msg.author_id.id if last_bot_msg else bot_partner_ids[0],
+                                            )
+
+                                            confirmation_handled = True
+                                            return result
+                                        except Exception as e:
+                                            _logger.error(f"Errore durante l'esecuzione diretta di cancel_sales_order: {e}", exc_info=True)
+                            else:
+                                _logger.info("Nessun marker [PENDING_CANCEL] trovato nell'ultimo messaggio del bot")
                     else:
                         _logger.info("ℹ️ Nessun messaggio del bot trovato per verificare la conferma")
             
-            # Chiama l'AI per generare una risposta (solo se non c'era conferma)
-            self._generate_ai_response(body)
+            # Chiama l'AI per generare una risposta SOLO se NON abbiamo già gestito una conferma
+            if not confirmation_handled:
+                self._generate_ai_response(body)
         
         return result
     

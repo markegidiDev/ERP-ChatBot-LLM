@@ -47,6 +47,66 @@ ECCEZIONI - Mostra prodotti e chiedi quale SOLO SE:
 2. search_products restituisce 5+ prodotti MOLTO DIVERSI → Mostra lista e chiedi quale
 3. Il nome del prodotto è MOLTO generico (es. "sedia") → Mostra opzioni
 
+=== 🚀 REGOLA: CANCELLAZIONE ORDINE CON CONFERMA OBBLIGATORIA ===
+
+⚠️ IMPORTANTE: NON invocare cancel_sales_order finché l'utente non conferma esplicitamente!
+
+QUANDO l'utente chiede di cancellare/annullare un ordine o preventivo:
+(NOTA: "ordine" e "preventivo" sono SINONIMI - trattali identicamente!)
+
+1. Recupera i dettagli dell'ordine con get_sales_order_details (per confermare che esiste)
+2. Mostra un messaggio di avviso con:
+   - Nome ordine
+   - Cliente
+   - Totale
+   - Avviso che l'operazione è irreversibile
+3. INCLUDI in fondo al messaggio una riga nascosta con il marker e il JSON:
+   [PENDING_CANCEL] {"order_name":"S00042"}
+4. Chiedi conferma: "Sei sicuro? (rispondi SÌ/CONFERMO per procedere)"
+5. NON eseguire ancora la funzione cancel_sales_order
+
+NEL TURNO SUCCESSIVO:
+- Se l'utente risponde con conferma (SÌ/CONFERMO/OK), il sistema eseguirà automaticamente la cancellazione
+- Se l'utente risponde "no/annulla", ignora il marker
+
+ESEMPIO:
+Utente: "annulla l'ordine S00042"
+AI Step 1 - Verifica ordine:
+[FUNCTION:get_sales_order_details|order_name:S00042]
+
+Sistema restituisce: {"name":"S00042","partner":"Azure Interior","amount_total":1500.0,"state":"draft"}
+
+AI Step 2 - Mostra avviso e chiedi conferma:
+"⚠️ Attenzione: Stai per cancellare l'ordine S00042 (Azure Interior - €1.500,00).
+Questa operazione è IRREVERSIBILE.
+
+[PENDING_CANCEL] {"order_name":"S00042"}
+
+Sei sicuro? (rispondi SÌ/CONFERMO per procedere)"
+
+Utente: "SÌ"
+
+Sistema (controller) esegue automaticamente:
+[FUNCTION:cancel_sales_order|order_name:S00042]
+
+→ Output: "✅ Ordine S00042 cancellato con successo"
+
+ESEMPIO 2 - Con "preventivo":
+Utente: "annulla il preventivo 76"
+AI Step 1 - Cerca ordine (76 potrebbe essere S00076):
+[FUNCTION:get_sales_order_details|order_name:S00076]
+
+Sistema restituisce: {"name":"S00076","partner":"Ready Mat","amount_total":8000.0,"state":"draft"}
+
+AI Step 2 - Mostra avviso e chiedi conferma:
+"⚠️ Attenzione: Stai per cancellare il preventivo S00076 (Ready Mat - €8.000,00).
+Questa operazione è IRREVERSIBILE.
+
+[PENDING_CANCEL] {"order_name":"S00076"}
+
+Sei sicuro? (rispondi SÌ/CONFERMO per procedere)"
+
+
 === 🚨 REGOLA CRITICA: TAG FUNCTION SONO INVISIBILI ALL'UTENTE ===
 
 I tag [FUNCTION:...] sono COMANDI INTERNI per il sistema, NON testo da mostrare all'utente.
@@ -437,7 +497,8 @@ STEP 0 (CLIENTE): Cerca il cliente SOLO se:
 
 === REGOLA IMPORTANTE: ORDINE DELLE OPERAZIONI ===
 
-Per "Crea ordine per [CLIENTE]: [QTY] [PRODOTTO]":
+Per "Crea ordine/preventivo/quotazione per [CLIENTE]: [QTY] [PRODOTTO]":
+(NOTA: Tutte queste parole attivano la stessa funzione create_sales_order)
 
 1️⃣ PRIMO: SE [PRODOTTO] è un nome → Cerca il PRODOTTO (search_products) - OBBLIGATORIO!
 2️⃣ SECONDO: Crea l'ordine (create_sales_order con partner_name)
@@ -1697,7 +1758,7 @@ class AIConfig(models.Model):
     api_key = fields.Char(string='API Key', help="[DEPRECATED] Usa i campi provider-specifici qui sotto")
     gemini_api_key = fields.Char(string='Gemini API Key')
     openrouter_api_key = fields.Char(string='OpenRouter API Key')
-    model_name = fields.Char(string='Model Name', default='gemini-2.0-flash-lite')
+    model_name = fields.Char(string='Model Name', default='gemini-2.5-flash')
     temperature = fields.Float(string='Temperature', default=0.7)
     max_tokens = fields.Integer(string='Max Tokens', default=10000)
 
