@@ -1,4 +1,4 @@
-from odoo import models, api
+from odoo import models, api, fields
 from markupsafe import Markup
 import requests
 import json
@@ -42,6 +42,10 @@ def format_html_response(text):
     if not text:
         return Markup("")
     
+    # FIX FORMATTAZIONE: Assicura che ogni punto elenco vada a capo se non lo è già
+    # Se trova un "•" che non è preceduto da newline, aggiunge un newline prima
+    text = re.sub(r'([^\n])\s*•', r'\1\n•', text)
+
     # Sostituisci doppi a capo con doppio <br/>
     text = text.replace('\n\n', '<br/><br/>')
     
@@ -73,6 +77,8 @@ def format_html_response(text):
 class DiscussChannel(models.Model):
     _inherit = 'discuss.channel'
     
+    pending_action_data = fields.Text(help="JSON data for pending AI actions (confirmation waiting)")
+
     # Questi metodi isolano logica specifica nel system prompt,
     # migliorando manutenibilità, testabilità e riducendo costi API.
     
@@ -453,7 +459,7 @@ class DiscussChannel(models.Model):
                 }
             },
             "search_products": {
-                "description": "Cerca prodotti nel catalogo. Supporta filtro per tipo: beni fisici, servizi, combo",
+                "description": "Cerca prodotti nel catalogo. IMPORTANTE: Elenca SEMPRE tutti i prodotti trovati, ANCHE SE HANNO STOCK 0 o sono esauriti. NON nascondere mai i risultati in base alla disponibilità.",
                 "parameters": {
                     "search_term": "Termine di ricerca (opzionale)",
                     "limit": "Numero massimo risultati (default 50)",
@@ -761,7 +767,6 @@ class DiscussChannel(models.Model):
                         f"Prodotti:\n  • " + "\n  • ".join(product_list) + "\n"
                         f"Data consegna: {marker_params.get('scheduled_date', 'oggi')}\n"
                         f"Totale stimato: €{total_estimate:.2f}\n\n"
-                        f"{PENDING_SO_MARKER} {json.dumps(marker_params)}\n\n"
                         f"Confermi? (rispondi SÌ/CONFERMO/OK VAI)"
                     )
                 }
@@ -838,14 +843,16 @@ class DiscussChannel(models.Model):
                         if 'order_name' in call_params:
                             params_for_marker['order_name'] = call_params['order_name']
 
-                        marker_json = json.dumps(params_for_marker)
                         message = (
                             f"⚠️ Stai per cancellare l'ordine {params_for_marker.get('order_name', params_for_marker.get('order_id', ''))}. "
                             "Questa operazione è distruttiva e non può essere annullata.\n\n"
-                            "Confermi la cancellazione? (rispondi SÌ/CONFERMO per procedere)\n\n"
-                            f"{PENDING_CANCEL_MARKER} {marker_json}"
+                            "Confermi la cancellazione? (rispondi SÌ/CONFERMO per procedere)"
                         )
-                        return {"requires_confirmation": True, "message": message}
+                        return {
+                            "requires_confirmation": True, 
+                            "pending_params": params_for_marker,
+                            "message": message
+                        }
                     except Exception:
                         # In caso di problema con il marker, fall back alla cancellazione diretta
                         _logger.exception("Errore creando marker conferma cancellazione - procedo con cancellazione diretta")
@@ -1056,178 +1063,76 @@ class DiscussChannel(models.Model):
             # Flag per tracciare se abbiamo gestito una conferma (evita di chiamare l'AI dopo)
             confirmation_handled = False
 
+            # --- GESTIONE CONFERMA AZIONI PENDING (DB-BASED) ---
             if re.search(r'\b(S[IÌI]|CONFERMO|OK\s*VAI|PERFETTO)\b', user_message, re.I):
-                _logger.info("Possibile conferma rilevata, verifico marker [PENDING_SO]")
-
-                bot_partner_ids = []
-                for xmlid in ('base.partner_root', 'base.partner_odoobot'):
-                    partner = self.env.ref(xmlid, raise_if_not_found=False)
-                    if partner:
-                        bot_partner_ids.append(partner.id)
-
-                if bot_partner_ids:
-                    last_bot_msg = self.env['mail.message'].search([
-                        ('model', '=', self._name),
-                        ('res_id', '=', self.id),
-                        ('author_id', 'in', bot_partner_ids),
-                        ('message_type', '=', 'comment'),
-                    ], order='date desc', limit=1)
-
-                    if last_bot_msg and last_bot_msg.body:
-                        msg_text = re.sub(r'<[^>]+>', '', last_bot_msg.body or '').strip()
-                        _logger.debug(f"Ultimo messaggio bot (200 char): {msg_text[:200]}")
-
-                        # Uso parser a contatore di graffe per JSON annidati
-                        text = msg_text
-                        idx = text.find(PENDING_SO_MARKER)
-                        if idx != -1:
-                            jstart = text.find('{', idx)
-                            if jstart != -1:
-                                depth = 0
-                                end = None
-                                for k, ch in enumerate(text[jstart:], start=jstart):
-                                    if ch == '{':
-                                        depth += 1
-                                    elif ch == '}':
-                                        depth -= 1
-                                        if depth == 0:
-                                            end = k + 1
-                                            break
-                                if end:
-                                    json_str = text[jstart:end]
-                                    _logger.info("Marker [PENDING_SO] trovato: eseguo create_sales_order senza AI")
-                                    try:
-                                        params = json.loads(json_str)
-
-                                        if 'scheduled_date' in params and isinstance(params['scheduled_date'], str):
-                                            from datetime import datetime
-                                            scheduled_str = params['scheduled_date']
-                                            try:
-                                                if ' ' in scheduled_str:
-                                                    params['scheduled_date'] = datetime.strptime(scheduled_str, "%Y-%m-%d %H:%M:%S")
-                                                else:
-                                                    params['scheduled_date'] = datetime.strptime(scheduled_str, "%Y-%m-%d")
-                                            except ValueError:
-                                                _logger.warning(f"Formato scheduled_date non valido: {scheduled_str}, rimuovo il parametro")
-                                                params.pop('scheduled_date', None)
-
-                                        warehouse_ops = self.env['warehouse.operations']
-                                        result_create = warehouse_ops.create_sales_order(**params)
-
-                                        lines = []
-                                        if isinstance(result_create, dict) and result_create.get('error'):
-                                            lines.append(f"⚠️ Errore: {result_create.get('error')}")
-                                            if result_create.get('details'):
-                                                lines.append(result_create['details'])
-                                        else:
-                                            order_name = result_create.get('sale_order_name') or result_create.get('order_name')
-                                            order_id = result_create.get('sale_order_id') or result_create.get('order_id')
-                                            if order_name:
-                                                lines.append(f"✅ Ordine creato: {order_name}")
-                                            if order_id:
-                                                lines.append(f"ID interno: {order_id}")
-
-                                            state = result_create.get('state', 'N/A')
-                                            state_map = {'draft': 'Bozza', 'sent': 'Inviato', 'sale': 'Confermato', 'done': 'Evaso'}
-                                            lines.append(f"Stato: {state_map.get(state, state)}")
-
-                                            pickings = result_create.get('pickings', [])
-                                            if pickings:
-                                                lines.append("\nConsegne generate:")
-                                                for p in pickings:
-                                                    lines.append(f"  • {p.get('picking_name')} - {p.get('scheduled_date', 'N/A')}")
-
-                                            lines.append(f"\nTotale: €{result_create.get('amount_total', 0):.2f}")
-
-                                        self.message_post(
-                                            body=format_html_response("\n\n".join(lines) if lines else "Operazione completata."),
-                                            message_type='comment',
-                                            subtype_xmlid='mail.mt_comment',
-                                            author_id=last_bot_msg.author_id.id if last_bot_msg else bot_partner_ids[0],
-                                        )
-
-                                        confirmation_handled = True
-                                        return result
-                                    except Exception as e:
-                                        _logger.error(f"Errore durante l'esecuzione diretta di create_sales_order: {e}", exc_info=True)
-                        else:
-                            _logger.info("Nessun marker [PENDING_SO] trovato nell'ultimo messaggio del bot")
-
-                # --- Gestione conferma cancellazione (PENDING_CANCEL) ---
-                if re.search(r'\b(S[IÌI]|CONFERMO|OK\s*VAI|PERFETTO)\b', user_message, re.I):
-                    _logger.info("Possibile conferma rilevata, verifico marker [PENDING_CANCEL]")
-
-                    bot_partner_ids = []
-                    for xmlid in ('base.partner_root', 'base.partner_odoobot'):
-                        partner = self.env.ref(xmlid, raise_if_not_found=False)
-                        if partner:
-                            bot_partner_ids.append(partner.id)
-
-                    if bot_partner_ids:
-                        last_bot_msg = self.env['mail.message'].search([
-                            ('model', '=', self._name),
-                            ('res_id', '=', self.id),
-                            ('author_id', 'in', bot_partner_ids),
-                            ('message_type', '=', 'comment'),
-                        ], order='date desc', limit=1)
-
-                        if last_bot_msg and last_bot_msg.body:
-                            msg_text = re.sub(r'<[^>]+>', '', last_bot_msg.body or '').strip()
-                            _logger.debug(f"Ultimo messaggio bot (200 char): {msg_text[:200]}")
-
-                            # Cerca marker PENDING_CANCEL
-                            text = msg_text
-                            idx = text.find(PENDING_CANCEL_MARKER)
-                            if idx != -1:
-                                jstart = text.find('{', idx)
-                                if jstart != -1:
-                                    depth = 0
-                                    end = None
-                                    for k, ch in enumerate(text[jstart:], start=jstart):
-                                        if ch == '{':
-                                            depth += 1
-                                        elif ch == '}':
-                                            depth -= 1
-                                            if depth == 0:
-                                                end = k + 1
-                                                break
-                                    if end:
-                                        json_str = text[jstart:end]
-                                        _logger.info("Marker [PENDING_CANCEL] trovato: eseguo cancel_sales_order senza AI")
-                                        try:
-                                            params = json.loads(json_str)
-
-                                            warehouse_ops = self.env['warehouse.operations']
-                                            result_cancel = warehouse_ops.cancel_sales_order(**params)
-
-                                            lines = []
-                                            if isinstance(result_cancel, dict) and result_cancel.get('error'):
-                                                lines.append(f"⚠️ Errore: {result_cancel.get('error')}")
-                                                if result_cancel.get('details'):
-                                                    lines.append(result_cancel['details'])
-                                            else:
-                                                order_name = result_cancel.get('order_name') or params.get('order_name')
-                                                order_id = result_cancel.get('order_id') or params.get('order_id')
-                                                if order_name:
-                                                    lines.append(f"✅ Ordine cancellato: {order_name}")
-                                                if order_id:
-                                                    lines.append(f"ID interno: {order_id}")
-
-                                            self.message_post(
-                                                body=format_html_response("\n\n".join(lines) if lines else "Operazione completata."),
-                                                message_type='comment',
-                                                subtype_xmlid='mail.mt_comment',
-                                                author_id=last_bot_msg.author_id.id if last_bot_msg else bot_partner_ids[0],
-                                            )
-
-                                            confirmation_handled = True
-                                            return result
-                                        except Exception as e:
-                                            _logger.error(f"Errore durante l'esecuzione diretta di cancel_sales_order: {e}", exc_info=True)
+                if self.pending_action_data:
+                    _logger.info("✅ Conferma rilevata e dati pending trovati nel DB")
+                    try:
+                        data = json.loads(self.pending_action_data)
+                        function_name = data.get('function')
+                        params = data.get('params')
+                        
+                        warehouse_ops = self.env['warehouse.operations']
+                        execution_result = None
+                        lines = []
+                        
+                        if function_name == 'create_sales_order':
+                            _logger.info("Eseguo create_sales_order confermato")
+                            
+                            # Gestione data
+                            if 'scheduled_date' in params and isinstance(params['scheduled_date'], str):
+                                from datetime import datetime
+                                scheduled_str = params['scheduled_date']
+                                try:
+                                    if ' ' in scheduled_str:
+                                        params['scheduled_date'] = datetime.strptime(scheduled_str, "%Y-%m-%d %H:%M:%S")
+                                    else:
+                                        params['scheduled_date'] = datetime.strptime(scheduled_str, "%Y-%m-%d")
+                                except ValueError:
+                                    params.pop('scheduled_date', None)
+                            
+                            execution_result = warehouse_ops.create_sales_order(**params)
+                            
+                            if isinstance(execution_result, dict) and execution_result.get('error'):
+                                lines.append(f"⚠️ Errore: {execution_result.get('error')}")
+                                if execution_result.get('details'):
+                                    lines.append(execution_result['details'])
                             else:
-                                _logger.info("Nessun marker [PENDING_CANCEL] trovato nell'ultimo messaggio del bot")
-                    else:
-                        _logger.info("ℹ️ Nessun messaggio del bot trovato per verificare la conferma")
+                                order_name = execution_result.get('sale_order_name') or execution_result.get('order_name')
+                                if order_name:
+                                    lines.append(f"✅ Ordine creato: {order_name}")
+                                state = execution_result.get('state', 'N/A')
+                                lines.append(f"Stato: {state}")
+                                lines.append(f"\nTotale: €{execution_result.get('amount_total', 0):.2f}")
+
+                        elif function_name == 'cancel_sales_order':
+                            _logger.info("Eseguo cancel_sales_order confermato")
+                            execution_result = warehouse_ops.cancel_sales_order(**params)
+                            
+                            if isinstance(execution_result, dict) and execution_result.get('error'):
+                                lines.append(f"⚠️ Errore: {execution_result.get('error')}")
+                            else:
+                                order_name = execution_result.get('order_name') or params.get('order_name')
+                                lines.append(f"✅ Ordine cancellato: {order_name}")
+
+                        # Invia risposta
+                        self.message_post(
+                            body=format_html_response("\n\n".join(lines) if lines else "Operazione completata."),
+                            message_type='comment',
+                            subtype_xmlid='mail.mt_comment',
+                            author_id=self.env.ref('base.partner_root').id,
+                        )
+                        
+                        # Pulisci stato
+                        self.pending_action_data = False
+                        confirmation_handled = True
+                        return result
+                        
+                    except Exception as e:
+                        _logger.error(f"Errore esecuzione azione pending: {e}", exc_info=True)
+                        self.pending_action_data = False # Reset on error to avoid loop
+                else:
+                    _logger.info("Conferma rilevata ma nessun dato pending nel DB")
             
             # Chiama l'AI per generare una risposta SOLO se NON abbiamo già gestito una conferma
             if not confirmation_handled:
@@ -1235,6 +1140,49 @@ class DiscussChannel(models.Model):
         
         return result
     
+    def _handle_pending_markers(self, text):
+        """
+        Cerca marker [PENDING_SO] o [PENDING_CANCEL] nel testo.
+        Se trovati, estrae il JSON, lo salva in self.pending_action_data
+        e restituisce il testo pulito senza marker e JSON.
+        """
+        if not text:
+            return text
+            
+        marker_map = {
+            '[PENDING_SO]': 'create_sales_order',
+            '[PENDING_CANCEL]': 'cancel_sales_order'
+        }
+        
+        for marker, function_name in marker_map.items():
+            if marker in text:
+                _logger.info(f"✅ Trovato marker {marker} - estraggo dati")
+                parts = text.split(marker)
+                clean_text = parts[0].strip()
+                json_part = parts[1] if len(parts) > 1 else ""
+                
+                # Estrai JSON
+                json_str = _balanced_json_extract_simple(json_part)
+                if json_str:
+                    try:
+                        params = json.loads(json_str)
+                        # Salva nel DB
+                        self.pending_action_data = json.dumps({
+                            'function': function_name,
+                            'params': params
+                        })
+                        _logger.info(f"✅ Dati salvati in pending_action_data ({function_name})")
+                    except Exception as e:
+                        _logger.error(f"Errore parsing/salvataggio JSON da marker: {e}")
+                
+                # Se il testo pulito non contiene una domanda di conferma, aggiungila
+                if not any(x in clean_text.lower() for x in ['confermi', 'procedo', 'vado avanti', 'ok?']):
+                    clean_text += "\n\nConfermi? (rispondi SÌ/CONFERMO/OK VAI)"
+                
+                return clean_text
+                
+        return text
+
     def _generate_ai_response(self, user_message):
         """Genera e invia una risposta AI"""
         try:
@@ -1243,11 +1191,8 @@ class DiscussChannel(models.Model):
             # Costruisci la storia della conversazione
             messages = []
             
-            # NOTA: Non aggiungo più functions_desc qui per risparmiare token
-            # Il System Prompt contiene già tutte le istruzioni necessarie
-            # functions_desc mi consumava ~500 token ad ogni messaggio!
             
-            # 🆕 CONTEXT INJECTION: Rileva se utente menziona "preventivo/ordine" per modifiche multi-prodotto
+            #  Rileva se utente menziona "preventivo/ordine" per modifiche multi-prodotto
             user_lower = user_message.lower()
             order_keywords = ['preventivo', 'ordine', 'aggiungi al', 'modifica', 'aggiorna', 'al preventivo', "all'ordine", 'rimuovi dal', 'togli dal']
             
@@ -1377,9 +1322,17 @@ class DiscussChannel(models.Model):
                 # uso interno 
                 summary_blocks = []
                 for function_name, parameters, result in executed_calls:
-                    summary_blocks.append(
-                        f"Risultato della funzione {function_name} con parametri {json.dumps(parameters)}: {json.dumps(result, indent=2)}"
-                    )
+                    # 🚨 CRITICO: Se il result contiene requires_confirmation, NON includere i dati raw
+                    # altrimenti l'AI li ricopia nel messaggio finale!
+                    if isinstance(result, dict) and result.get('requires_confirmation'):
+                        # Per conferme, passa SOLO un riassunto minimo
+                        summary_blocks.append(
+                            f"Risultato: richiesta conferma per {function_name}"
+                        )
+                    else:
+                        summary_blocks.append(
+                            f"Risultato della funzione {function_name} con parametri {json.dumps(parameters)}: {json.dumps(result, indent=2)}"
+                        )
 
                 # Se abbiamo almeno una funzione di scrittura/creazione,compongo io la conferma e la pubblico.
                 mutating_fns = {'create_sales_order', 'create_partner', 'create_delivery_order', 'validate_delivery'}
@@ -1390,8 +1343,19 @@ class DiscussChannel(models.Model):
                         #Se il risultato richiede conferma, uso SOLO il messaggio formattato
                         if isinstance(result, dict) and result.get('requires_confirmation'):
                             _logger.info("✅ Richiesta conferma per create_sales_order - uso SOLO il campo 'message'")
+                            
+                            # SALVA STATO NEL DB (DiscussChannel)
+                            # Questo evita problemi di sanitizzazione HTML e rende il sistema robusto
+                            self.pending_action_data = json.dumps({
+                                'function': function_name,
+                                'params': result.get('pending_params', parameters)
+                            })
                           
+                            # 🚨 CRITICO: Estrai SOLO il messaggio, rimuovi marker se presente
                             final_response = result.get('message', 'Confermi?')
+                            if '[PENDING_SO]' in final_response or '[PENDING_CANCEL]' in final_response:
+                                _logger.warning(f"⚠️ MARKER trovato in message dopo requires_confirmation - pulisco!")
+                                final_response = re.sub(r'\[PENDING_(?:SO|CANCEL)\]\s*\{[^}]*\}', '', final_response).strip()
                             break
                     
                     # Se non abbiamo già un final_response (nessuna conferma richiesta)
@@ -1438,6 +1402,7 @@ class DiscussChannel(models.Model):
                         {'role': 'user', 'content': "\n\n".join(summary_blocks) + 
                             "\n\nGenera una risposta chiara e professionale per l'utente utilizzando questi dati." +
                             "\nNON includere tag [FUNCTION:...] nella risposta." +
+                            "\nNON includere marker [PENDING_SO] o [PENDING_CANCEL] nella risposta." +
                             "\nRICORDA: Le funzioni sono già state eseguite, tu devi solo comunicare i risultati." +
                             "\nFORMATTAZIONE IMPORTANTE:" +
                             "\n- Usa doppio ritorno a capo (\\n\\n) tra ogni elemento di una lista" +
@@ -1453,6 +1418,11 @@ class DiscussChannel(models.Model):
                     if '[FUNCTION:' in final_response:
                         _logger.warning(f"AI ha incluso tag FUNCTION nella risposta finale, li rimuovo: {final_response}")
                         final_response = re.sub(r'\[FUNCTION:[^\]]+\]', '', final_response).strip()
+                    
+                    # 🆕 Rimuovi marker se presenti (l'AI non dovrebbe generarli ma per sicurezza)
+                    if '[PENDING_SO]' in final_response or '[PENDING_CANCEL]' in final_response:
+                        _logger.warning(f"⚠️ AI ha incluso marker nella risposta - rimuovo!")
+                        final_response = re.sub(r'\[PENDING_(?:SO|CANCEL)\]\s*\{[^}]*\}', '', final_response).strip()
 
                     # fallback
                     if not final_response:
@@ -1474,6 +1444,12 @@ class DiscussChannel(models.Model):
                     final_response = re.sub(r'\[FUNCTION:[^\]]+\]', '', final_response).strip()
             except Exception:
                 pass
+
+            # 🆕 CLEANUP MARKERS (CRITICO: Esegui PRIMA di format_html_response!)
+            if '[PENDING_SO]' in final_response or '[PENDING_CANCEL]' in final_response:
+                _logger.warning(f"⚠️ Trovato marker in final_response - pulisco: {final_response[:100]}")
+                final_response = self._handle_pending_markers(final_response)
+                _logger.info(f"✅ Dopo pulizia: {final_response[:100]}")
 
             # Formatta con HTML
             formatted_response = format_html_response(final_response)

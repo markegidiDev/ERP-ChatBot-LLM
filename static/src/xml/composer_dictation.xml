@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+    <!-- Eredita il template del Composer di Odoo -->
+    <t t-inherit="mail.Composer" t-inherit-mode="extension">
+        <!-- Inserisci il bottone nel footer (Odoo 18 compatibile) -->
+        <xpath expr="//div[contains(@class, 'o-mail-Composer-footer')]" position="inside">
+            <button class="btn btn-link o-mail-Composer-action" 
+                    t-att-class="{ 'text-danger': dictationState.isListening }"
+                    t-on-click="toggleDictation" 
+                    title="Dettatura Vocale">
+                <i class="fa fa-microphone" t-if="!dictationState.isListening"/>
+                <i class="fa fa-stop-circle fa-spin" t-if="dictationState.isListening"/>
+            </button>
+        </xpath>
+    </t>
+</templates>

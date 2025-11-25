@@ -28,6 +28,10 @@ def format_html_response(text):
     if not text:
         return Markup("")
     
+    # FIX FORMATTAZIONE: Assicura che ogni punto elenco vada a capo se non lo è già
+    # Se trova un "•" che non è preceduto da newline, aggiunge un newline prima
+    text = re.sub(r'([^\n])\s*•', r'\1\n•', text)
+
     # Sostituisci doppi a capo con doppio <br/>
     text = text.replace('\n\n', '<br/><br/>')
     
@@ -398,6 +402,50 @@ class MailBot(models.AbstractModel):
         #  fallback alla logica sta
         return super()._apply_logic(record, values, command)
     
+    def _handle_pending_markers(self, channel, text):
+        """
+        Cerca marker [PENDING_SO] o [PENDING_CANCEL] nel testo.
+        Se trovati, estrae il JSON, lo salva in channel.pending_action_data
+        e restituisce il testo pulito senza marker e JSON.
+        """
+        if not text:
+            return text
+            
+        marker_map = {
+            '[PENDING_SO]': 'create_sales_order',
+            '[PENDING_CANCEL]': 'cancel_sales_order'
+        }
+        
+        for marker, function_name in marker_map.items():
+            if marker in text:
+                _logger.info(f"✅ Trovato marker {marker} - estraggo dati")
+                parts = text.split(marker)
+                clean_text = parts[0].strip()
+                json_part = parts[1] if len(parts) > 1 else ""
+                
+                # Estrai JSON
+                json_str = _balanced_json_extract(json_part)
+                if json_str:
+                    try:
+                        params = json.loads(json_str)
+                        # Salva nel DB
+                        if hasattr(channel, 'pending_action_data'):
+                            channel.pending_action_data = json.dumps({
+                                'function': function_name,
+                                'params': params
+                            })
+                            _logger.info(f"✅ Dati salvati in pending_action_data ({function_name})")
+                    except Exception as e:
+                        _logger.error(f"Errore parsing/salvataggio JSON da marker: {e}")
+                
+                # Se il testo pulito non contiene una domanda di conferma, aggiungila
+                if not any(x in clean_text.lower() for x in ['confermi', 'procedo', 'vado avanti', 'ok?']):
+                    clean_text += "\n\nConfermi? (rispondi SÌ/CONFERMO/OK VAI)"
+                
+                return clean_text
+                
+        return text
+
     def _get_ai_response(self, user_message, channel):
         """Ottiene una risposta dall'AI"""
         try:
@@ -691,7 +739,7 @@ class MailBot(models.AbstractModel):
                     # ⚠️ Se l'AI ha generato PENDING_SO invece di update_sales_order, restituisci direttamente!
                     if '[PENDING_SO]' in next_response or '[PENDING_CANCEL]' in next_response:
                         _logger.info("✅ AI ha generato PENDING marker dopo batch search - restituisco direttamente")
-                        return format_html_response(next_response)
+                        return format_html_response(self._handle_pending_markers(channel, next_response))
                     
                     if next_calls:
                         function_name, parameters = next_calls[0]
@@ -753,7 +801,7 @@ class MailBot(models.AbstractModel):
                         # Se l'AI ha comunque restituito un messaggio testuale (es. "ordine non trovato"),
                         # mostralo all'utente invece del messaggio generico.
                         if next_response:
-                            return format_html_response(next_response)
+                            return format_html_response(self._handle_pending_markers(channel, next_response))
                         return format_html_response("⚠️ Errore: impossibile completare la modifica. Riprova.")
                 
                 # ✅ Se create_sales_order richiede conferma, restituisci SOLO il messaggio formattato
@@ -775,12 +823,34 @@ class MailBot(models.AbstractModel):
                             )
                         _logger.info(f"✅ Data riepilogo allineata a: {sd}")
                     
+                    # SALVA STATO NEL DB (DiscussChannel)
+                    if hasattr(channel, 'pending_action_data'):
+                        try:
+                            channel.pending_action_data = json.dumps({
+                                'function': 'create_sales_order',
+                                'params': result.get('pending_params')
+                            })
+                            _logger.info("✅ Stato pending salvato nel DB (create_sales_order)")
+                        except Exception as e:
+                            _logger.error(f"Errore salvataggio pending_action_data: {e}")
+
                     # 🚨 FIX: Restituisci SOLO il messaggio, NON tutto il dict
                     _logger.info("✅ Richiesta conferma - restituisco SOLO il campo 'message'")
                     return format_html_response(result.get('message', 'Confermi?'))
 
                 # ✅ Se cancel_sales_order richiede conferma, restituisci SOLO il messaggio formattato
                 if function_name == 'cancel_sales_order' and isinstance(result, dict) and result.get('requires_confirmation'):
+                    # SALVA STATO NEL DB (DiscussChannel)
+                    if hasattr(channel, 'pending_action_data'):
+                        try:
+                            channel.pending_action_data = json.dumps({
+                                'function': 'cancel_sales_order',
+                                'params': result.get('pending_params')
+                            })
+                            _logger.info("✅ Stato pending salvato nel DB (cancel_sales_order)")
+                        except Exception as e:
+                            _logger.error(f"Errore salvataggio pending_action_data: {e}")
+
                     _logger.info("✅ Richiesta conferma cancellazione - restituisco SOLO il campo 'message'")
                     return format_html_response(result.get('message'))
 
@@ -1080,6 +1150,9 @@ class MailBot(models.AbstractModel):
                     # Rimuovi eventuali tag FUNCTION residui, per sicurezza
                     final_response = re.sub(r'\[FUNCTION:[^\]]+\]', '', final_response).strip()
                     
+                    # 🆕 CLEANUP MARKERS prima di formattare
+                    final_response = self._handle_pending_markers(channel, final_response)
+                    
                     # Formatta con HTML
                     return format_html_response(final_response)
 
@@ -1088,13 +1161,15 @@ class MailBot(models.AbstractModel):
                 # Il marker è la risposta finale, il controller gestirà la conferma
                 if '[PENDING_SO]' in ai_response or '[PENDING_CANCEL]' in ai_response:
                     _logger.info("✅ Risposta contiene PENDING marker - restituisco direttamente senza follow-up")
-                    return format_html_response(ai_response)
+                    clean_text = self._handle_pending_markers(channel, ai_response)
+                    return format_html_response(clean_text)
                 
                 # ⚠️ Se non ci sono function_calls, significa che l'AI ha già generato la risposta finale
                 # Questo succede dopo batch search quando l'AI genera PENDING_SO invece di update_sales_order
                 if not function_calls or len(function_calls) == 0:
                     _logger.info("✅ Nessuna function call trovata - risposta finale dell'AI")
-                    return format_html_response(ai_response)
+                    cleaned_response = self._handle_pending_markers(channel, ai_response)
+                    return format_html_response(cleaned_response)
                 
                 # Se abbiamo appena eseguito search_products, l'utente probabilmente vuole creare un ordine
                 # Quindi chiediamo esplicitamente all'AI di generare create_sales_order
@@ -1151,12 +1226,15 @@ class MailBot(models.AbstractModel):
                                         else:
                                             lines.append(f"✅ {next_fn} eseguita")
                                     formatted_response = "\n\n".join(lines) if lines else "Operazione completata."
-                                    return format_html_response(formatted_response)
+                                    return format_html_response(self._handle_pending_markers(channel, formatted_response))
                         
                         # Rimuovi i tag dalla risposta finale
                         final_response = re.sub(r'\[FUNCTION:[^\]]+\]', '', final_response).strip()
                 except Exception as e:
                     _logger.warning(f"Errore parsing funzioni aggiuntive: {e}")
+                
+                # 🆕 CLEANUP MARKERS prima di formattare
+                final_response = self._handle_pending_markers(channel, final_response)
                 
                 # Formatta con HTML
                 return format_html_response(final_response)
@@ -1169,6 +1247,9 @@ class MailBot(models.AbstractModel):
             if ai_response and clean_response and len(clean_response) < len(ai_response) * 0.7:
                 _logger.warning(f"⚠️ clean_response ({len(clean_response)} char) molto più corto di ai_response ({len(ai_response)} char) - uso originale")
                 final_response = ai_response
+            
+            # 🆕 CLEANUP MARKERS
+            final_response = self._handle_pending_markers(channel, final_response)
             
             return format_html_response(final_response)
             
@@ -1188,8 +1269,18 @@ class MailBot(models.AbstractModel):
             return None
         
         _logger.info("✅ Confirmation keyword detected!")
+
+        # 🆕 CHECK DB FIRST (New Architecture)
+        if hasattr(channel, 'pending_action_data') and channel.pending_action_data:
+            try:
+                data = json.loads(channel.pending_action_data)
+                if data.get('function') == 'create_sales_order':
+                    _logger.info(f"✅ Found pending data in DB: {data}")
+                    return data.get('params')
+            except Exception as e:
+                _logger.error(f"Errore leggendo pending_action_data: {e}")
         
-        # Look for [PENDING_SO] marker in last bot message
+        # Look for [PENDING_SO] marker in last bot message (LEGACY FALLBACK)
         try:
             from odoo.addons.ai_livebot.models.ai_chatbot import PENDING_SO_MARKER
             
@@ -1255,6 +1346,16 @@ class MailBot(models.AbstractModel):
             return None
         
         _logger.info("✅ Confirmation keyword detected!")
+
+        # 🆕 CHECK DB FIRST (New Architecture)
+        if hasattr(channel, 'pending_action_data') and channel.pending_action_data:
+            try:
+                data = json.loads(channel.pending_action_data)
+                if data.get('function') == 'cancel_sales_order':
+                    _logger.info(f"✅ Found pending cancel data in DB: {data}")
+                    return data.get('params')
+            except Exception as e:
+                _logger.error(f"Errore leggendo pending_action_data: {e}")
         
         try:
             from odoo.addons.ai_livebot.models.ai_chatbot import PENDING_CANCEL_MARKER
@@ -1398,7 +1499,11 @@ class MailBot(models.AbstractModel):
             return False
     
     def _has_pending_marker(self, channel):
-        """Check if there's a pending marker in recent messages"""
+        """Check if there's a pending marker in recent messages or DB"""
+        # 🆕 CHECK DB FIRST
+        if hasattr(channel, 'pending_action_data') and channel.pending_action_data:
+            return True
+
         try:
             from odoo.addons.ai_livebot.models.ai_chatbot import PENDING_SO_MARKER
             
