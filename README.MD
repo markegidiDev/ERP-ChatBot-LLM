@@ -71,6 +71,12 @@ ai_livebot/
 │   ├── ai_chatbot.py         # Logica chat e orchestrazione LLM
 │   ├── warehouse_operations.py # Operazioni magazzino e ricerca prodotti
 │   └── odoobot_override.py   # Override risposta OdooBot standard
+├── docs/
+│   └── MANUALE_UTENTE.md     # Manuale operativo per l'utente finale
+├── static/
+│   └── src/
+│       ├── js/               # Logica frontend (Speech-to-Text)
+│       └── xml/              # Template UI (Microfono)
 ├── views/
 │   └── ai_config_views.xml   # UI configurazione AI
 ├── controllers/
