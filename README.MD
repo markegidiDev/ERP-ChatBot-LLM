@@ -48,6 +48,11 @@ Il sistema usa **Google Gemini** o **OpenRouter** come LLM backend per interpret
 - Verifica stato e dettagli picking (WH/OUT/xxxxx)
 - Aggiornamento automatico stato consegne
 
+### 🎙️ **Dettatura Vocale (Speech-to-Text)**
+- Dettatura messaggi vocali direttamente nella chat
+- Integrazione nativa con Web Speech API (Chrome/Edge)
+- Trascrizione in tempo reale senza costi server
+
 ### ⚙️ **Configurazione AI Flessibile**
 - Supporto multipli provider: **Google Gemini** e **OpenRouter**
 - Configurazione modelli, temperatura, max_tokens

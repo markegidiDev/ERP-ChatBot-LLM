@@ -35,6 +35,7 @@
 - ✅ Annullare ordini in bozza con conferma
 - ✅ Controllare disponibilità magazzino
 - ✅ Gestire consegne e delivery orders
+- ✅ **Dettare messaggi vocali** (Speech-to-Text)
 
 ### Sinonimi supportati:
 **"ordine"**, **"preventivo"**, **"quotazione"** e **"offerta"** sono **sinonimi** in Odoo - l'AI li tratta identicamente!
@@ -327,6 +328,25 @@ Dopo aver salvato:
 - ✅ Se manca la chiave API per il provider scelto, riceverai un **errore di validazione**
 - ✅ Il sistema garantisce che ci sia **sempre e solo un profilo attivo**
 - ✅ Apri la chat di Odoo e prova: `"Ciao, sei attivo?"`
+
+---
+
+## 🎙️ Dettatura Vocale
+
+Il modulo include una funzionalità di **Speech-to-Text** integrata direttamente nella chat di Odoo.
+
+### Come funziona
+1. Nella barra di scrittura della chat, clicca sull'icona del **microfono** 🎙️.
+2. L'icona diventerà un quadrato rotante (stop) per indicare che sta ascoltando.
+3. Parla naturalmente (es. *"Crea un ordine per 5 sedie"*).
+4. Il testo verrà trascritto in tempo reale nel campo di input.
+5. Clicca di nuovo l'icona per fermare o invia direttamente il messaggio.
+
+### Requisiti Browser
+La funzionalità utilizza le **Web Speech API** native del browser.
+- ✅ **Supportato**: Google Chrome, Microsoft Edge, Safari, Browser basati su Chromium.
+- ❌ **Non supportato**: Firefox (richiede configurazione avanzata), Internet Explorer.
+- 🔒 **Nota**: Richiede contesto sicuro (HTTPS o localhost).
 
 ---
 
